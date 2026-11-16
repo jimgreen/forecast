@@ -1,6 +1,7 @@
 # Runtime SQLite state and generated model artifacts
 data/forecast.db*
 data/models/
+data/*.log
 
 # Python and test caches
 .pytest_cache/
