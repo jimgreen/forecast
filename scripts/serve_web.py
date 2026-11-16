@@ -242,6 +242,16 @@ def run_schedule(schedule: dict[str, object]) -> list[str]:
     return run_ids
 
 
+def observation_summary(point_id: str | None = None) -> list[dict[str, object]]:
+    with DB.connection() as conn:
+        if point_id:
+            rows = conn.execute("SELECT point_id,source,COUNT(*) AS sample_count,MAX(timestamp_utc) AS last_timestamp,AVG(CASE WHEN quality_code='valid' THEN 1.0 ELSE 0.0 END) AS quality FROM weather_observations WHERE point_id=? GROUP BY point_id,source ORDER BY point_id,source", (point_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT point_id,source,COUNT(*) AS sample_count,MAX(timestamp_utc) AS last_timestamp,AVG(CASE WHEN quality_code='valid' THEN 1.0 ELSE 0.0 END) AS quality FROM weather_observations GROUP BY point_id,source ORDER BY point_id,source").fetchall()
+        points = {row["point_id"]: row["name"] for row in conn.execute("SELECT point_id,name FROM forecast_points")}
+    return [{"station_id": row["point_id"], "name": f"{points.get(row['point_id'], row['point_id'])} · {row['source']}", "point_id": row["point_id"], "source": row["source"], "variables": "风速 / 温度 / 辐射", "sample_count": row["sample_count"], "last_timestamp": row["last_timestamp"], "quality": round(float(row["quality"] or 0) * 100, 1), "status": "在线" if row["last_timestamp"] else "无数据"} for row in rows]
+
+
 class SchedulerThread(threading.Thread):
     daemon = True
 
@@ -300,9 +310,10 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path in {"/api/forecast", "/api/curves"}:
                 point_id = query.get("point_id", ["P001"])[0]; horizon = query.get("horizon", ["day_ahead"])[0]
                 if horizon not in HORIZONS: raise ValueError("unsupported horizon")
-                self.json_response({"point_id": point_id, "horizon": horizon, "rows": DB.get_forecast_rows(point_id, horizon, horizon_count(horizon))})
+                run_id = query.get("run_id", [None])[0]
+                self.json_response({"point_id": point_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, horizon_count(horizon), run_id)})
             elif parsed.path == "/api/runs":
-                self.json_response({"runs": DB.list_runs(min(max(int(query.get("limit", [50])[0]), 1), 200))})
+                self.json_response({"runs": DB.list_runs(min(max(int(query.get("limit", [50])[0]), 1), 200), query.get("status", [None])[0], query.get("point_id", [None])[0])})
             elif parsed.path == "/api/models":
                 self.json_response({"models": DB.list_models(query.get("point_id", [None])[0], query.get("horizon", [None])[0])})
             elif parsed.path in {"/api/training-runs", "/api/trainings"}:
@@ -311,8 +322,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({"updates": DB.list_model_updates(int(query.get("limit", [50])[0]))})
             elif parsed.path == "/api/schedules":
                 self.json_response({"schedules": DB.list_schedules()})
+            elif parsed.path == "/api/nwp-sources":
+                self.json_response({"sources": DB.list_nwp_sources()})
+            elif parsed.path == "/api/tasks":
+                self.json_response({"tasks": DB.list_tasks(query.get("point_id", [None])[0])})
+            elif parsed.path == "/api/observation-summary":
+                self.json_response({"stations": observation_summary(query.get("point_id", [None])[0])})
+            elif parsed.path == "/api/status":
+                health = DB.health()
+                self.json_response({"health": health, "latest_run": DB.list_runs(1)[0] if DB.list_runs(1) else None, "active_models": len([m for m in DB.list_models() if m["status"] == "active"]), "schedules": len([s for s in DB.list_schedules() if s["enabled"]])})
+            elif parsed.path == "/api/settings":
+                self.json_response({"settings": DB.get_settings()})
             elif parsed.path == "/api/evaluations":
-                self.json_response({"evaluations": DB.list_evaluations(query.get("run_id", [None])[0], int(query.get("limit", [100])[0]))})
+                self.json_response({"evaluations": DB.list_evaluations(query.get("run_id", [None])[0], query.get("point_id", [None])[0], int(query.get("limit", [100])[0]))})
             elif parsed.path == "/api/weather-observations":
                 self.json_response({"observations": DB.list_weather_observations(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
             elif parsed.path == "/api/energy-measurements":
@@ -333,6 +355,11 @@ class Handler(BaseHTTPRequestHandler):
                 if horizon not in HORIZONS or kind not in KINDS or trigger not in TRIGGERS: raise ValueError("invalid run parameters")
                 point_ids = payload.get("point_ids") or [payload.get("point_id", "P001")]
                 if not isinstance(point_ids, list) or not point_ids: raise ValueError("point_ids must contain at least one point")
+                known_points = {point["id"]: point for point in DB.list_points()}
+                unknown = [str(point_id) for point_id in point_ids if str(point_id) not in known_points]
+                disabled = [str(point_id) for point_id in point_ids if str(point_id) in known_points and not known_points[str(point_id)]["enabled"]]
+                if unknown: raise ValueError(f"unknown point_ids: {', '.join(unknown)}")
+                if disabled: raise ValueError(f"disabled point_ids: {', '.join(disabled)}")
                 run_results = []
                 for point_id in point_ids:
                     run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, payload.get("scheduled_at"))
@@ -352,6 +379,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(evaluate_run(str(payload["run_id"])))
             elif parsed.path == "/api/schedules":
                 schedule = dict(payload); schedule.setdefault("schedule_id", new_id("SCH")); schedule.setdefault("point_ids", ["P001"]); schedule.setdefault("forecast_kind", "combined"); schedule.setdefault("horizon", "day_ahead"); schedule.setdefault("cadence_minutes", 1440); schedule.setdefault("enabled", True); schedule.setdefault("next_run_at", now_iso()); DB.upsert_schedule(schedule); self.json_response({"status": "saved", "schedule": next(item for item in DB.list_schedules() if item["schedule_id"] == schedule["schedule_id"])})
+            elif parsed.path == "/api/nwp-sources":
+                source = dict(payload); source.setdefault("source_id", new_id("NWP")); DB.upsert_nwp_source(source); self.json_response({"status": "saved", "sources": DB.list_nwp_sources()})
+            elif parsed.path == "/api/tasks":
+                task = dict(payload); task.setdefault("task_id", new_id("TASK")); DB.upsert_task(task); self.json_response({"status": "saved", "task": next(item for item in DB.list_tasks() if item["task_id"] == task["task_id"])})
+            elif parsed.path == "/api/settings":
+                DB.save_settings(payload); self.json_response({"status": "saved", "settings": DB.get_settings()})
             elif parsed.path == "/api/points":
                 point = point_payload(payload); DB.upsert_point(point); self.json_response({"status": "saved", "point": next(item for item in DB.list_points() if item["id"] == point["id"])})
             elif parsed.path == "/api/weather-observations":

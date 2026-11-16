@@ -280,10 +280,7 @@ class ForecastDB:
                     """INSERT INTO forecast_points
                     (point_id,name,point_type,latitude,longitude,pv_capacity_kw,wind_capacity_kw,objects_json,enabled,model_name,weather_source,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(point_id) DO UPDATE SET name=excluded.name, point_type=excluded.point_type,
-                    latitude=excluded.latitude, longitude=excluded.longitude, pv_capacity_kw=excluded.pv_capacity_kw,
-                    objects_json=excluded.objects_json,
-                    wind_capacity_kw=excluded.wind_capacity_kw, updated_at=excluded.updated_at""",
+                    ON CONFLICT(point_id) DO NOTHING""",
                     (*row[:7], json.dumps(self._objects_for_point(row[2], row[5], row[6]), ensure_ascii=False), *row[7:], now, now),
                 )
             nwp = [
@@ -294,8 +291,7 @@ class ForecastDB:
                 conn.execute(
                     """INSERT INTO nwp_sources(source_id,name,provider,model_name,endpoint,refresh_minutes,variables_json,enabled,status,updated_at)
                     VALUES(?,?,?,?,?,?,?,1,'configured',?)
-                    ON CONFLICT(source_id) DO UPDATE SET name=excluded.name, endpoint=excluded.endpoint,
-                    refresh_minutes=excluded.refresh_minutes, variables_json=excluded.variables_json, updated_at=excluded.updated_at""",
+                    ON CONFLICT(source_id) DO NOTHING""",
                     (source_id, name, provider, model, endpoint, refresh, json.dumps(variables, ensure_ascii=False), now),
                 )
             conn.execute(
@@ -305,6 +301,13 @@ class ForecastDB:
                 ON CONFLICT(schedule_id) DO NOTHING""",
                 ("SCH-DEFAULT-DAY-AHEAD", "默认日前预测", json.dumps(["P001", "P002", "P003"]), "combined", "day_ahead", 1440, now, now),
             )
+            for point_id in ("P001", "P002", "P003"):
+                for horizon, schedule_time in (("ultrashort", "每15分钟"), ("day_ahead", "06:00"), ("week_ahead", "06:30")):
+                    conn.execute(
+                        """INSERT INTO forecast_tasks(task_id,point_id,forecast_kind,horizon,enabled,schedule_time,timezone,updated_at)
+                        VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(task_id) DO NOTHING""",
+                        (f"TASK-{point_id}-{horizon}", point_id, "combined", horizon, schedule_time, "Pacific/Auckland", now),
+                    )
 
     def upsert_point(self, point: Mapping[str, object]) -> None:
         now = utc_now()
@@ -326,11 +329,29 @@ class ForecastDB:
 
     def list_points(self) -> list[dict[str, object]]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM forecast_points ORDER BY point_id").fetchall()
-        return [
-            {"id": r["point_id"], "name": r["name"], "type": r["point_type"], "lat": r["latitude"], "lon": r["longitude"], "pv": r["pv_capacity_kw"], "wind": r["wind_capacity_kw"], "objects": json.loads(r["objects_json"] or "[]"), "enabled": bool(r["enabled"]), "model": r["model_name"], "source": r["weather_source"], "quality": "待检查", "lastRun": "未运行"}
-            for r in rows
-        ]
+            rows = conn.execute(
+                """SELECT p.*,
+                    (SELECT MAX(started_at) FROM forecast_runs r WHERE r.point_id=p.point_id) AS last_run_at,
+                    (SELECT AVG(CASE WHEN quality_code='valid' THEN 1.0 ELSE 0.0 END)
+                       FROM weather_observations w WHERE w.point_id=p.point_id) AS weather_quality,
+                    (SELECT AVG(CASE WHEN quality_code='valid' THEN 1.0 ELSE 0.0 END)
+                       FROM energy_measurements e WHERE e.point_id=p.point_id) AS energy_quality
+                   FROM forecast_points p ORDER BY p.point_id"""
+            ).fetchall()
+        result = []
+        for row in rows:
+            quality_values = [value for value in (row["weather_quality"], row["energy_quality"]) if value is not None]
+            quality = f"{sum(quality_values) / len(quality_values) * 100:.1f}%" if quality_values else "待检查"
+            result.append(
+                {
+                    "id": row["point_id"], "name": row["name"], "type": row["point_type"],
+                    "lat": row["latitude"], "lon": row["longitude"], "pv": row["pv_capacity_kw"],
+                    "wind": row["wind_capacity_kw"], "objects": json.loads(row["objects_json"] or "[]"),
+                    "enabled": bool(row["enabled"]), "model": row["model_name"], "source": row["weather_source"],
+                    "quality": quality, "lastRun": row["last_run_at"] or "未运行",
+                }
+            )
+        return result
 
     @staticmethod
     def _objects_for_point(point_type: object, pv: object, wind: object) -> list[str]:
@@ -357,9 +378,16 @@ class ForecastDB:
         with self.connection() as conn:
             conn.execute("UPDATE forecast_runs SET status=?, finished_at=?, rows_written=?, error_message=? WHERE run_id=?", (status, utc_now(), rows_written, error_message, run_id))
 
-    def list_runs(self, limit: int = 50) -> list[dict[str, object]]:
+    def list_runs(self, limit: int = 50, status: str | None = None, point_id: str | None = None) -> list[dict[str, object]]:
         with self.connection() as conn:
-            rows = conn.execute("SELECT * FROM forecast_runs ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()
+            clauses = []
+            params: list[object] = []
+            if status:
+                clauses.append("status=?"); params.append(status)
+            if point_id:
+                clauses.append("point_id=?"); params.append(point_id)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = conn.execute(f"SELECT * FROM forecast_runs{where} ORDER BY started_at DESC LIMIT ?", (*params, min(max(int(limit), 1), 200))).fetchall()
         return [dict(r) for r in rows]
 
     def register_model(self, model: Mapping[str, object]) -> None:
@@ -457,6 +485,64 @@ class ForecastDB:
             item = dict(row); item["point_ids"] = json.loads(item.pop("point_ids_json") or "[]"); item["enabled"] = bool(item["enabled"]); result.append(item)
         return result
 
+    def list_nwp_sources(self) -> list[dict[str, object]]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT * FROM nwp_sources ORDER BY source_id").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["variables"] = json.loads(item.pop("variables_json") or "[]")
+            item["enabled"] = bool(item["enabled"])
+            result.append(item)
+        return result
+
+    def upsert_nwp_source(self, source: Mapping[str, object]) -> None:
+        now = utc_now()
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO nwp_sources(source_id,name,provider,model_name,endpoint,refresh_minutes,variables_json,enabled,status,last_sync_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(source_id) DO UPDATE SET name=excluded.name,provider=excluded.provider,model_name=excluded.model_name,
+                endpoint=excluded.endpoint,refresh_minutes=excluded.refresh_minutes,variables_json=excluded.variables_json,
+                enabled=excluded.enabled,status=excluded.status,last_sync_at=excluded.last_sync_at,updated_at=excluded.updated_at""",
+                (source["source_id"], source.get("name", source["source_id"]), source.get("provider", "custom"), source.get("model_name", "custom"), source.get("endpoint"), int(source.get("refresh_minutes", 60)), json.dumps(source.get("variables", []), ensure_ascii=False), int(bool(source.get("enabled", True))), source.get("status", "configured"), source.get("last_sync_at"), now),
+            )
+
+    def list_tasks(self, point_id: str | None = None) -> list[dict[str, object]]:
+        with self.connection() as conn:
+            if point_id:
+                rows = conn.execute("SELECT * FROM forecast_tasks WHERE point_id=? ORDER BY task_id", (point_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM forecast_tasks ORDER BY task_id").fetchall()
+        return [dict(row) | {"enabled": bool(row["enabled"])} for row in rows]
+
+    def get_settings(self) -> dict[str, object]:
+        with self.connection() as conn:
+            rows = conn.execute("SELECT key,value FROM schema_meta WHERE key LIKE 'setting.%'").fetchall()
+        result = {}
+        for row in rows:
+            try:
+                result[row["key"][8:]] = json.loads(row["value"])
+            except json.JSONDecodeError:
+                result[row["key"][8:]] = row["value"]
+        return result
+
+    def save_settings(self, settings: Mapping[str, object]) -> None:
+        with self.connection() as conn:
+            for key, value in settings.items():
+                conn.execute("INSERT INTO schema_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"setting.{key}", json.dumps(value, ensure_ascii=False)))
+
+    def upsert_task(self, task: Mapping[str, object]) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """INSERT INTO forecast_tasks(task_id,point_id,forecast_kind,horizon,enabled,schedule_time,timezone,updated_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(task_id) DO UPDATE SET point_id=excluded.point_id,forecast_kind=excluded.forecast_kind,
+                horizon=excluded.horizon,enabled=excluded.enabled,schedule_time=excluded.schedule_time,
+                timezone=excluded.timezone,updated_at=excluded.updated_at""",
+                (task["task_id"], task["point_id"], task.get("forecast_kind", "combined"), task.get("horizon", "day_ahead"), int(bool(task.get("enabled", True))), task.get("schedule_time"), task.get("timezone", "Pacific/Auckland"), utc_now()),
+            )
+
     def mark_schedule_run(self, schedule_id: str, run_id: str, next_run_at: str) -> None:
         with self.connection() as conn:
             conn.execute("UPDATE forecast_schedules SET last_run_at=?,last_run_id=?,next_run_at=?,updated_at=? WHERE schedule_id=?", (utc_now(), run_id, next_run_at, utc_now(), schedule_id))
@@ -469,12 +555,22 @@ class ForecastDB:
                 (evaluation["evaluation_id"], evaluation["run_id"], evaluation.get("point_id"), evaluation["forecast_kind"], evaluation["horizon"], evaluation.get("window_start"), evaluation.get("window_end"), evaluation.get("sample_count", 0), evaluation.get("status", "pending"), evaluation.get("mae"), evaluation.get("rmse"), evaluation.get("bias"), evaluation.get("nmae"), evaluation.get("coverage"), json.dumps(evaluation.get("metrics", {}), ensure_ascii=False), evaluation.get("evaluated_at", utc_now())),
             )
 
-    def list_evaluations(self, run_id: str | None = None, limit: int = 100) -> list[dict[str, object]]:
+    def list_evaluations(self, run_id: str | None = None, point_id: str | None = None, limit: int = 100) -> list[dict[str, object]]:
         with self.connection() as conn:
+            clauses = []
+            params: list[object] = []
             if run_id:
-                rows = conn.execute("SELECT * FROM forecast_evaluations WHERE run_id=? ORDER BY evaluated_at DESC LIMIT ?", (run_id, min(max(int(limit), 1), 500))).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM forecast_evaluations ORDER BY evaluated_at DESC LIMIT ?", (min(max(int(limit), 1), 500),)).fetchall()
+                clauses.append("run_id=?"); params.append(run_id)
+            if point_id:
+                clauses.append("point_id=?"); params.append(point_id)
+            where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = conn.execute(
+                f"""SELECT * FROM (
+                    SELECT e.*, ROW_NUMBER() OVER (PARTITION BY e.run_id ORDER BY e.evaluated_at DESC) AS rn
+                    FROM forecast_evaluations e{where}
+                ) WHERE rn=1 ORDER BY evaluated_at DESC LIMIT ?""",
+                (*params, min(max(int(limit), 1), 500)),
+            ).fetchall()
         result = []
         for row in rows:
             item = dict(row); item["metrics"] = json.loads(item.pop("metrics_json") or "{}"); result.append(item)
@@ -540,10 +636,16 @@ class ForecastDB:
         self.finish_run(run_id, "success", len(rows))
         return len(rows)
 
-    def get_forecast_rows(self, point_id: str, horizon: str, limit: int) -> list[dict[str, object]]:
+    def get_forecast_rows(self, point_id: str, horizon: str, limit: int, run_id: str | None = None) -> list[dict[str, object]]:
         with self.connection() as conn:
+            latest_filter = "l.run_id=?" if run_id else "l.rn=1"
+            latest_params: tuple[object, ...] = (run_id,) if run_id else ()
             rows = conn.execute(
-                """SELECT timestamp,wind_speed_mps,temperature_c,solar_radiation_wm2,
+                f"""WITH latest AS (
+                    SELECT run_id, ROW_NUMBER() OVER (ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC) AS rn
+                    FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
+                )
+                SELECT timestamp,wind_speed_mps,temperature_c,solar_radiation_wm2,
                 pv_power_kw,wind_power_kw,load_kw,source FROM (
                     SELECT w.target_time_utc AS timestamp,
                     w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
@@ -551,7 +653,8 @@ class ForecastDB:
                     COALESCE(w.source,'calculated') AS source
                     FROM weather_forecasts w LEFT JOIN energy_forecasts e
                     ON w.run_id=e.run_id AND w.target_time_utc=e.target_time_utc
-                    WHERE w.point_id=? AND w.horizon=?
+                    JOIN latest l ON l.run_id=w.run_id
+                    WHERE w.point_id=? AND w.horizon=? AND {latest_filter}
                     UNION ALL
                     SELECT e.target_time_utc AS timestamp,
                     w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
@@ -559,16 +662,17 @@ class ForecastDB:
                     'calculated' AS source
                     FROM energy_forecasts e LEFT JOIN weather_forecasts w
                     ON w.run_id=e.run_id AND w.target_time_utc=e.target_time_utc
-                    WHERE e.point_id=? AND e.horizon=? AND w.run_id IS NULL
+                    JOIN latest l ON l.run_id=e.run_id
+                    WHERE e.point_id=? AND e.horizon=? AND w.run_id IS NULL AND {latest_filter}
                 ) ORDER BY timestamp LIMIT ?""",
-                (point_id, horizon, point_id, horizon, limit),
+                (point_id, horizon, point_id, horizon, *latest_params, point_id, horizon, *latest_params, min(max(int(limit), 1), 2000)),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def health(self) -> dict[str, object]:
         with self.connection() as conn:
             tables = {}
-            for table in ("forecast_points", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations"):
+            for table in ("forecast_points", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "nwp_sources", "forecast_tasks", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations"):
                 tables[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {"status": "ok", "path": str(self.path), "schema_version": SCHEMA_VERSION, "tables": tables}
 
