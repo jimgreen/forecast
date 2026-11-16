@@ -1,0 +1,18 @@
+
+# Ignore binaries and large files
+*.pkl
+*.csv
+*.h5
+*.pyc
+*.png
+*.prof
+**/outputs/
+**/dist/*
+**/build/*
+**/loadforecasting_models.egg-info/*
+**/loadforecasting_framework.egg-info/*
+**/loadforecasting_models/build/*
+**/loadforecasting_models/.venv/**
+.venv/
+
+optuna_study.db

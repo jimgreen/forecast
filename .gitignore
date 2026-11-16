@@ -1,0 +1,10 @@
+# Runtime SQLite state and generated model artifacts
+data/forecast.db*
+data/models/
+
+# Python and test caches
+.pytest_cache/
+**/__pycache__/
+*.py[cod]
+
+vendor/**/.git.vendor/

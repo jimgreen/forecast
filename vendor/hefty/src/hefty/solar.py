@@ -1,0 +1,2149 @@
+import numpy as np
+import pandas as pd
+import xarray as xr
+from herbie import Herbie, FastHerbie
+import pvlib
+import time
+from hefty.utilities import model_input_formatter, get_fcast_dataframe
+import warnings
+
+try:
+    import cdsapi
+except ImportError:
+    _has_cdsapi = False
+else:
+    _has_cdsapi = True
+import os
+from herbie import config
+
+
+def get_solar_forecast(latitude, longitude, init_date, run_length,
+                       lead_time_to_start=0, model='gfs', member=None,
+                       attempts=2, hrrr_hour_middle=None,
+                       hrrr_coarsen_window=None, priority=None,
+                       cams_api_key=None, cams_area=None,
+                       decomp_model=None, output_interval=60,
+                       remove_gribs=False):
+    """
+    Get a solar resource forecast for one or several sites from one of several
+    NWPs. This function uses Herbie [1]_ and pvlib [2]_.
+
+    Parameters
+    ----------
+    latitude : float or list of floats
+        Latitude in decimal degrees. Positive north of equator, negative
+        to south.
+
+    longitude : float or list of floats
+        Longitude in decimal degrees. Positive east of prime meridian,
+        negative to west.
+
+    init_date : pandas-parsable datetime
+        Model initialization datetime. Note that this should be UTC and on the
+        hour for the models currently available with hefty, and most models
+        don't initialize every hour. See
+        :py:func:`hefty.utilities.adjust_forecast_datetimes` for help
+        determining appropriate init_date values.
+
+    run_length : int
+        Length of the forecast in hours - number of hours forecasted
+
+    lead_time_to_start : int, optional
+        Number of hours between init_date (initialization) and the first
+        forecasted interval. NOAA GFS data goes out 384 hours, so run_length
+        + lead_time_to_start must be less than or equal to 384.
+
+    model : string, default 'gfs'
+        Forecast model. Default is NOAA GFS ('gfs'), but can also be ECMWF IFS
+        single ('ifs'), ECMWF AIFS single ('aifs'), NOAA HRRR ('hrrr'), or
+        NOAA GEFS ('gefs') (a single member from the ensemble). ECMWF CAMS
+        ('cams') is an experimental option. It requires cdsapi to be installed
+        and a CDS API key to be passed via the 'cams_api_key' parameter.
+
+    member: string or int, default 'avg'
+        For models that are ensembles pass an appropriate single member label.
+        See Herbie documentation for details [1]_. Options for GEFS include
+        'avg' or 'mean' (the ensemble mean), 0 or 'c00' (control member), and
+        1-30 or 'p01'-'p30' for the 30 individual members.
+
+    attempts : int, optional
+        Number of times to try getting forecast data. The function will pause
+        for n^2 minutes after each n attempt, e.g., 1 min after the first
+        attempt, 4 minutes after the second, etc.
+
+    hrrr_hour_middle : bool, default True
+        If model is 'hrrr', setting this False keeps the forecast at the
+        native instantaneous top-of-hour format. True (default) shifts
+        the forecast to middle of the hour, more closely representing an
+        integrated hourly forecast that is centered in the middle of the
+        hour.
+
+    hrrr_coarsen_window : int or None, default None
+        If model is 'hrrr', optional setting that is the x and y window size
+        for coarsening the xarray dataset, effectively applying spatial
+        smoothing to the HRRR model. The HRRR has a native resolution of
+        about 3 km, so a value of 10 results in approx. 30 x 30 km grid.
+
+    priority : list or string
+        List of model sources to get the data in the order of download
+        priority, or string for a single source. See Herbie docs.
+        Typical values would be 'aws' or 'google'.
+
+    cams_api_key : string
+        Climate Data Store (CDS) API key, which is required for the 'cams'
+        model option. See https://ads.atmosphere.copernicus.eu/how-to-api.
+
+    cams_area : list, optional
+        List of latitude and logitude coordinates defining the North, West,
+        South, and East corners of the area to be covered when using 'cams'.
+        For example, [50, -125, 20, -65] approximately covers CONUS.
+
+    decomp_model : string, optional
+        Decomposition model to use for forecast models that don't include DNI.
+        Options include 'dirindex' and 'erbs'. Note that HRRR and CAMS include
+        DNI, so this parameter does not apply to those models.
+
+    output_interval : numeric, default 60
+        Interval length, in minutes, of intermediate solar calculations and
+        the output interval. Default is 60, but shorter intervals (e.g., 5)
+        could provide benefit due to improved accuracy in decomposition, at
+        the expense of longer computation times. Must be a factor of 60.
+
+    remove_gribs : bool, default False
+        Remove grib and index files after downloading and processing them.
+        Note that directory structure will remain. Does not do anything
+        if priority='dynamical'.
+
+    Returns
+    -------
+    data : pandas.DataFrane
+        timeseries forecasted solar resource data
+
+    References
+    ----------
+
+    .. [1] `Blaylock, B. K. (YEAR). Herbie: Retrieve Numerical Weather
+       Prediction Model Data (Version 20xx.x.x) [Computer software].
+       <https://doi.org/10.5281/zenodo.4567540>`_
+    .. [2] `Anderson, K., et al. “pvlib python: 2023 project update.” Journal
+       of Open Source Software, 8(92), 5994, (2023).
+       <http://dx.doi.org/10.21105/joss.05994>`_
+    """
+
+    # set clear sky model. could be an input variable at some point
+    # model_cs = 'simplified_solis'
+    model_cs_kwargs = {
+        'aod700': 0.05,
+        'precipitable_water': 0.5,
+    }
+    # minimum cosine of zenith, same default used in pvlib.irradiance
+    # functions. Could be an input variable at some point
+    min_cos_zenith = 0.065
+    # maximum csi
+    max_csi = 1.5
+
+    # variable formatting
+    # if lat, lon are single values, convert to lists for pickpoints later
+    if type(latitude) is float or type(latitude) is int:
+        latitude = [latitude]
+        longitude = [longitude]
+    num_sites = len(latitude)
+    # convert init_date to datetime
+    init_date = pd.to_datetime(init_date)
+
+    # CHECK INPUTS
+    # check model
+    if model not in {'hrrr', 'gfs', 'gefs', 'ifs', 'ifs_ens',
+                     'aifs', 'aifs_ens', 'cams'}:
+        raise ValueError(f'model="{model}" is not compatible with this'
+                         ' function.')
+    # check if init_date is top of hour
+    if init_date != init_date.floor('1h'):
+        raise ValueError(f'init_date must be on the hour, e.g., '
+                         f'{init_date.floor('1h')}, not {init_date}. '
+                         'Consider using init_date.floor("1h") or '
+                         'similar')
+    # check decomp for models that don't need it
+    if decomp_model is not None and model in ['hrrr', 'cams']:
+        warnings.warn(f'model={model} does not require decomposition, but you '
+                      f'entered decomp_model="{decomp_model}". This will not '
+                      'do anything.')
+    # hrrr parameters for models other than hrrr
+    if hrrr_hour_middle is not None and model != 'hrrr':
+        warnings.warn(f'You entered hrrr_hour_middle=False, which does not '
+                      f'apply to the model you entered, "{model}". This will '
+                      'not do anything.')
+    if hrrr_coarsen_window is not None and model != 'hrrr':
+        warnings.warn(f'You entered hrrr_coarsen_window={hrrr_coarsen_window},'
+                      f' which does not apply to the model you entered, '
+                      f'"{model}". This will not do anything.')
+    # cams with priority
+    if model == 'cams' and priority is not None:
+        warnings.warn(f'You entered model="cams" and priority={priority}. CAMS'
+                      ' IFS is accessed via CAMS/CDS by default and '
+                      f'the input priority={priority} will be ignored.')
+    # member but not an ensemble
+    if model not in ['ifs_ens', 'aifs_ens', 'gefs'] and member is not None:
+        warnings.warn(f'You entered member={member} and model={model}, but '
+                      f'{model} is not an ensemble and does not have members.'
+                      f'The input member={member} will be ignored.')
+    # provided cams inputs for model not cams
+    if model != 'cams' and ((cams_area is not None) or
+                            (cams_api_key is not None)):
+        warnings.warn(f'You provided an input for one or both of cams_area or '
+                      f'cams_api_key. Those inputs are not used for model='
+                      f'{model} and will be ignored.')
+
+    # fill in defaults as needed
+    if model in ['ifs_ens', 'aifs_ens', 'gefs'] and member is None:
+        member = 'avg'
+    if model == 'hrrr' and hrrr_hour_middle is None:
+        hrrr_hour_middle = True
+    if model not in ['hrrr', 'cams'] and decomp_model is None:
+        decomp_model = 'dirindex'
+
+    # get model-specific Herbie inputs
+    date, fxx_range, product, search_str = model_input_formatter(
+        init_date, run_length, lead_time_to_start, model,
+        resource_type='solar', member=member)
+
+    # get NWP data as dataframe
+    if model != 'cams':
+        df_temp = get_fcast_dataframe(
+            latitude, longitude, date, fxx_range, model,
+            search_str, priority, product=product,
+            fast=False, attempts=attempts,
+            resource_type='solar',
+            member=member,
+            hrrr_coarsen_window=hrrr_coarsen_window,
+            remove_gribs=remove_gribs)
+
+    elif model == 'cams':
+        if not _has_cdsapi:
+            raise ImportError(('cdsapi is required to use cams, '
+                               'e.g., with `pip install cdsapi`.'))
+        # directory path for saving cams files
+        cams_dir_path = os.path.join(config['default']['save_dir'], 'cams')
+        # if cams folder doesn't exist, make it
+        if not os.path.exists(cams_dir_path):
+            os.makedirs(cams_dir_path)
+
+        if cams_area is None:
+            cams_area = [90, -180, -90, 180]
+
+        ts = pd.Timestamp(date)
+        date_str = ts.strftime('%Y-%m-%d')
+        time_str = ts.strftime('%H:%M')
+        filename = (
+            f'cams.{ts.strftime('%Y%m%d')}.{ts.strftime('%H')}z.'
+            f'{min(fxx_range):0{3}}.{max(fxx_range):0{3}}.'
+            f'{cams_area[0]}N_{cams_area[1]}E_{cams_area[2]}E_{cams_area[3]}N'
+            f'.grib'
+            )
+        download_path_file = os.path.join(
+            cams_dir_path,
+            filename)
+
+        if os.path.exists(download_path_file):  # load file if it exists
+            ds = xr.load_dataset(download_path_file)
+        else:  # otherwise download file
+            request = {
+                'variable': ['surface_solar_radiation_downward_clear_sky',
+                             'surface_solar_radiation_downwards',
+                             '2m_temperature',
+                             '10m_u_component_of_wind',
+                             '10m_v_component_of_wind',
+                             'direct_solar_radiation',
+                             'clear_sky_direct_solar_radiation_at_surface',
+                             ],
+                'date': [date_str],
+                'time': [time_str],
+                'leadtime_hour': [str(i) for i in fxx_range],
+                'type': ['forecast'],
+                'data_format': 'grib',
+                'area': cams_area,  # [N, W, S, E]
+                'nocache': str(round(time.time())),
+            }
+            URL = 'https://ads.atmosphere.copernicus.eu/api'
+            client = cdsapi.Client(url=URL, key=cams_api_key)
+            dataset = "cams-global-atmospheric-composition-forecasts"
+            client.retrieve(dataset, request).download(download_path_file)
+            ds = xr.load_dataset(download_path_file)
+
+        if remove_gribs:
+            # Delete the grib file
+            if os.path.exists(download_path_file):
+                os.remove(download_path_file)
+
+        # convert wind
+        ds = ds.herbie.with_wind()
+        # rename 'ssrd' to 'sdswrf', 'dsrp' to 'vbdsf'
+        ds = ds.rename({'ssrd': 'sdswrf',
+                        'dsrp': 'vbdsf'})
+
+        # use pick_points for single point or list of points
+        method = 'weighted'
+        # point can be at most about 1.5 grid cells away from furthest of 4
+        # nearest neighbors (far corner of region). At ~45km max per 0.4 deg
+        # cell, that's sqrt(2*(45*1.5)^2) = ~96km
+        max_distance = 96
+        # use_cached_tree = True # hold off on saving a BallTree for now...
+        # tree_name = 'cams_balltree'
+        ds_temp = ds.herbie.pick_points(
+                        pd.DataFrame(
+                            {
+                                "latitude": latitude,
+                                "longitude": longitude,
+                            }
+                        ),
+                        method=method,
+                        max_distance=max_distance,
+                        # use_cached_tree=use_cached_tree,
+                        # tree_name=tree_name,
+                    )
+
+        # convert to dataframe
+        df_temp = ds_temp.to_dataframe()
+        if method == 'weighted':
+            # filter to a single "k"
+            df_temp = (df_temp[df_temp.index.isin([0], level='k')].
+                       droplevel(level='k'))
+
+        # reset index
+        df_temp = df_temp.reset_index().set_index('valid_time')
+
+        # add timezone
+        df_temp = df_temp.tz_localize('UTC', level='valid_time')
+        # rename wind speed
+        df_temp = df_temp.rename(columns={
+            'si10': 'wind_speed',
+            'wdir10': 'wind_direction',
+            })
+        # convert air temperature units
+        df_temp['temp_air'] = df_temp['t2m'] - 273.15
+
+        # list of all possible column names to keep
+        keep_cols = ['point', 'sdswrf', 'wind_speed', 'wind_direction',
+                     'temp_air', 'ssrdc', 'vbdsf', 'cdir', 'step']
+        # filter columns
+        df_temp = df_temp[df_temp.columns.intersection(keep_cols)]
+
+        # convert step to lead_time
+        df_temp['step'] = df_temp['step'] / np.timedelta64(1, 'h')
+        df_temp.rename(columns={'step': 'lead_time'}, inplace=True)
+
+        # make index valid_time
+        df_temp = df_temp.reset_index().set_index(['valid_time'])
+
+    # work through sites
+    dfs = {}  # empty list of dataframes
+    for j in range(num_sites):
+        df = df_temp[df_temp['point'] == j]
+
+        loc = pvlib.location.Location(
+            latitude=latitude[j],
+            longitude=longitude[j],
+            tz=df.index.tz
+            )
+
+        # make 1min interval clear sky data covering our time range
+        times_1min = pd.date_range(
+            start=df.index[0]+pd.Timedelta('30s'),
+            end=df.index[-1]-pd.Timedelta('30s'),
+            freq='1min',
+            tz='UTC')
+        # calculate clear sky ghi with pvlib
+        sp_1min = pvlib.solarposition.ephemeris(
+            times_1min,
+            loc.latitude,
+            loc.longitude
+        )
+        apparent_elevation_1min = sp_1min['apparent_elevation']
+        cs_1min = pvlib.clearsky.simplified_solis(
+            apparent_elevation_1min,
+            **model_cs_kwargs
+        )
+
+        if model in {'gfs', 'gefs'}:
+            # for gfs and gefs ghi: we have to "unmix" the rolling average
+            # irradiance that resets every 6 hours
+            mixed = df[['sdswrf']].copy()
+            mixed['hour'] = mixed.index.hour
+            mixed['hour_of_mixed_period'] = ((mixed['hour'] - 1) % 6) + 1
+            mixed['sdswrf_prev'] = mixed['sdswrf'].shift(
+                periods=1,
+                fill_value=0
+                )
+            mixed['int_len'] = mixed.index.diff().total_seconds().values / 3600
+
+            # set the first interval length:
+            if model == 'gfs' and lead_time_to_start >= 120:
+                mixed.loc[mixed.index[0], 'int_len'] = 1
+            else:
+                mixed.loc[mixed.index[0], 'int_len'] = 3
+            unmixed = ((mixed['hour_of_mixed_period'] * mixed['sdswrf']
+                        - (mixed['hour_of_mixed_period'] - mixed['int_len'])
+                        * mixed['sdswrf_prev']) / mixed['int_len'])
+            # clip to avoid occasional small negative ghi in GEFS, see GH #35
+            df['ghi'] = unmixed.clip(lower=0)
+
+        elif model in {'ifs', 'ifs_ens', 'aifs', 'aifs_ens', 'cams'}:
+            # for ifs ghi: cumulative J/m^s to average W/m^2 over the interval
+            # ending at the valid time. calculate difference in measurement
+            # over diff in time to get avg J/s/m^2 = W/m^2
+            if priority == 'dynamical':
+                df['ghi'] = df['sdswrf']
+            else:
+                df['ghi'] = (df['sdswrf'].diff() /
+                             df.index.diff().seconds.values)
+
+            if model == 'cams':
+                df['dni'] = (df['vbdsf'].diff() /
+                             df.index.diff().seconds.values)
+                df['ghi_clear_nwp'] = (df['ssrdc'].diff() /
+                                       df.index.diff().seconds.values)
+                df['direct_horiz_clear'] = (df['cdir'].diff() /
+                                            df.index.diff().seconds.values)
+
+        elif model == 'hrrr':
+            df['ghi'] = df['sdswrf']
+            df['dni'] = df['vbdsf']
+
+        if model in {'gfs', 'gefs', 'ifs', 'ifs_ens', 'aifs', 'aifs_ens'}:
+            # calculate average CS ghi over the intervals from the forecast
+            # based on list comprehension example in
+            # https://stackoverflow.com/a/55724134/27574852
+            ghi = cs_1min['ghi']
+            dates = df.index
+            ghi_clear = [
+                ghi.loc[(ghi.index > dates[i]) & (ghi.index <= dates[i+1])]
+                .mean() for i in range(len(dates) - 1)
+                ]
+
+            # write to df
+            df['ghi_clear'] = [np.nan] + ghi_clear
+
+            # calculate clear sky index of ghi, dni
+            df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+
+            # clip at max csi
+            df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+
+            # avoid divide by zero issues
+            df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+
+            # n-min version of data, centered at bottom of the interval
+            new_index = pd.date_range(df.index.min(),
+                                      df.index.max(),
+                                      freq=f'{output_interval/2}min',
+                                      name='valid_time')
+            cols = ['temp_air', 'wind_speed', 'wind_direction',
+                    'lead_time']
+            df_interp = df[cols].reindex(
+                new_index).interpolate(method='time')
+            df_n_min = df_interp.iloc[1::2]
+
+            # "backfill" ghi csi
+            # merge based on nearest index from n-min version looking forward
+            # in 3hr version
+            df_n_min = pd.merge_asof(
+                left=df_n_min,
+                right=df['ghi_csi'],
+                on='valid_time',
+                direction='forward'
+            ).set_index('valid_time')
+
+            # make n-min interval clear sky centered at bottom of the interval
+            if output_interval == 1:
+                times_n_min = times_1min
+                sp_n_min = sp_1min
+                cs_n_min = cs_1min
+            else:
+                times_n_min = pd.date_range(
+                    start=df.index[0]+pd.Timedelta(output_interval/2, 'min'),
+                    end=df.index[-1]-pd.Timedelta(output_interval/2, 'min'),
+                    freq=f'{output_interval}min',
+                    tz='UTC')
+
+                # calculate clear sky ghi with pvlib
+                sp_n_min = pvlib.solarposition.ephemeris(
+                    times_n_min,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation_n_min = sp_n_min['apparent_elevation']
+                cs_n_min = pvlib.clearsky.simplified_solis(
+                    apparent_elevation_n_min,
+                    **model_cs_kwargs
+                )
+
+            # calculate ghi from clear sky and backfilled forecasted clear sky
+            # index
+            df_n_min['ghi'] = cs_n_min['ghi'] * df_n_min['ghi_csi']
+
+            # clip to avoid occasional small negative ghi in GEFS, see GH #35
+            df_n_min['ghi'] = df_n_min['ghi'].clip(lower=0)
+
+            # decompose
+            if decomp_model == 'erbs':
+                out_erbs = pvlib.irradiance.erbs(
+                    df_n_min['ghi'],
+                    sp_n_min['zenith'],
+                    df_n_min.index,
+                )
+                df_n_min['dni'] = out_erbs['dni']
+                df_n_min['dhi'] = out_erbs['dhi']
+            elif decomp_model == 'dirindex':
+                cs_decomp = cs_n_min  # could later use a different cs model...
+                decomp = pvlib.irradiance.dirindex(
+                    ghi=df_n_min['ghi'],
+                    ghi_clear=cs_decomp['ghi'],
+                    dni_clear=cs_decomp['dni'],
+                    zenith=sp_n_min['zenith'],
+                    times=times_n_min,
+                )
+                df_n_min['dni'] = decomp.fillna(0)
+                cos_zenith = np.maximum(
+                    np.cos(np.deg2rad(sp_n_min['apparent_zenith'])),
+                    min_cos_zenith
+                )
+                df_n_min['dhi'] = (df_n_min['ghi'] -
+                                   (df_n_min['dni'] * cos_zenith))
+
+            # add clearsky ghi
+            df_n_min['ghi_clear'] = df_n_min['ghi'] / df_n_min['ghi_csi']
+
+            dfs[j] = df_n_min
+
+        elif model == 'cams':
+            # make n-min interval clear sky centered at bottom of the interval
+            if output_interval == 1:
+                times_n_min = times_1min
+                sp_n_min = sp_1min
+                cs_n_min = cs_1min
+            else:
+                times_n_min = pd.date_range(
+                    start=df.index[0]+pd.Timedelta(output_interval/2, 'min'),
+                    end=df.index[-1]-pd.Timedelta(output_interval/2, 'min'),
+                    freq=f'{output_interval}min',
+                    tz='UTC')
+
+                # calculate clear sky ghi with pvlib
+                sp_n_min = pvlib.solarposition.ephemeris(
+                    times_n_min,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation_n_min = sp_n_min['apparent_elevation']
+                cs_n_min = pvlib.clearsky.simplified_solis(
+                    apparent_elevation_n_min,
+                    **model_cs_kwargs
+                )
+            # calculate clear sky direct horizontal irr
+            cos_zenith_n_min = np.maximum(
+                np.cos(np.deg2rad(sp_n_min['apparent_zenith'])),
+                min_cos_zenith)
+            cs_n_min['direct_horiz'] = (cs_n_min['dni'] * cos_zenith_n_min)
+            # n-min version of data, centered at bottom of the interval
+            new_index = pd.date_range(df.index.min(),
+                                      df.index.max(),
+                                      freq=f'{output_interval/2}min',
+                                      name='valid_time')
+            cols = ['temp_air', 'wind_speed', 'wind_direction',
+                    'lead_time']
+            df_interp = df[cols].reindex(
+                new_index).interpolate(method='time')
+            df_n_min = df_interp.iloc[1::2]
+
+            if output_interval < 60:
+                # calculate average CS ghi/dni over the intervals from the
+                # forecast based on list comprehension example in
+                # https://stackoverflow.com/a/55724134/27574852
+                dates = df.index
+                ghi_clear = [
+                    cs_1min['ghi'].loc[
+                        (cs_1min['ghi'].index > dates[i]) &
+                        (cs_1min['ghi'].index <= dates[i+1])
+                        ]
+                    .mean() for i in range(len(dates) - 1)
+                    ]
+                dni_clear = [
+                    cs_1min['dni'].loc[
+                        (cs_1min['dni'].index > dates[i]) &
+                        (cs_1min['dni'].index <= dates[i+1])
+                        ]
+                    .mean() for i in range(len(dates) - 1)
+                    ]
+
+                # write to df
+                df['ghi_clear'] = [np.nan] + ghi_clear
+                df['dni_clear'] = [np.nan] + dni_clear
+                # calculate clear sky index of ghi, dni, ghi_clear_nwp
+                df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+                df['dni_csi'] = df['dni'] / df['dni_clear']
+                df['ghi_clear_nwp_csi'] = df['ghi_clear_nwp'] / df['ghi_clear']
+
+                # clip at max csi
+                df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+                df['dni_csi'] = df['dni_csi'].clip(upper=max_csi)
+                df['ghi_clear_nwp_csi'] = df['ghi_clear_nwp_csi'].clip(upper=max_csi)
+
+                # avoid divide by zero issues
+                df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+                df.loc[df['dni_clear'] == 0, 'dni_csi'] = 0
+                df.loc[df['ghi_clear_nwp'] == 0, 'ghi_clear_nwp_csi'] = 0
+
+                # 1min pvlib clear sky direct horizontal irradiance
+                cos_zenith_1min = np.maximum(
+                    np.cos(np.deg2rad(sp_1min['apparent_zenith'])),
+                    min_cos_zenith)
+                cs_1min['direct_horiz'] = (cs_1min['dni'] * cos_zenith_1min)
+                # 60min pvlib clear sky direct horizontal irradiance
+                # right-labeled to match df
+                direct_horiz_clear = cs_1min['direct_horiz'].resample(
+                    '60min', label='right').mean()
+                # 60min csi of forecasted clear sky direct horiz irrad
+                df['direct_horiz_clear_csi'] = (df['direct_horiz_clear'] /
+                                                direct_horiz_clear)
+                # avoid divide by zero issues
+                df.loc[df['direct_horiz_clear'] == 0,
+                       'direct_horiz_clear_csi'] = 0
+
+                # "backfill" csi values
+                df_n_min = pd.merge_asof(
+                    left=df_n_min,
+                    right=df[
+                        ['ghi_csi', 'dni_csi', 'ghi_clear_nwp_csi',
+                         'direct_horiz_clear_csi']],
+                    direction='forward', right_index=True, left_index=True
+                )
+
+                df_n_min['ghi'] = df_n_min['ghi_csi'] * cs_n_min['ghi']
+                df_n_min['dni'] = df_n_min['dni_csi'] * cs_n_min['dni']
+                df_n_min['direct_horiz_clear'] = (df_n_min[
+                    'direct_horiz_clear_csi'] * cs_n_min['direct_horiz'])
+                df_n_min['dni_clear'] = (df_n_min['direct_horiz_clear'] /
+                                         cos_zenith_n_min)
+                df_n_min['ghi_clear_nwp'] = (df_n_min['ghi_clear_nwp_csi'] *
+                                             cs_n_min['ghi'])
+
+                # calculate dhi from ghi, dni, solar position
+                df_n_min['dhi'] = (df_n_min['ghi'] -
+                                   (df_n_min['dni'] * cos_zenith_n_min))
+            elif output_interval == 60:
+                # adjust timestamps to center of interval
+                df.index = df.index - pd.Timedelta('30min')
+
+                # direct horiz clear to dni_clear
+                sp = pvlib.solarposition.ephemeris(
+                    df.index,
+                    loc.latitude,
+                    loc.longitude
+                )
+                cos_zenith = np.maximum(
+                    np.cos(np.deg2rad(sp['apparent_zenith'])),
+                    min_cos_zenith)
+                df['dni_clear'] = (df['direct_horiz_clear'] / cos_zenith)
+
+                df_n_min = df_n_min.join(df.drop(
+                    ['temp_air', 'wind_speed', 'wind_direction', 'lead_time'],
+                    axis=1))
+
+                # calculate dhi from ghi, dni, solar position
+                df_n_min['dhi'] = (df_n_min['ghi'] -
+                                   (df_n_min['dni'] * cos_zenith))
+
+            # clean up dataframe
+            df_n_min['ghi_clear'] = df_n_min['ghi_clear_nwp']
+            df_n_min = df_n_min[['temp_air', 'wind_speed', 'wind_direction',
+                                 'ghi', 'dni', 'dhi', 'ghi_clear',
+                                 'dni_clear', 'lead_time',
+                                 'direct_horiz_clear']]
+
+            dfs[j] = df_n_min
+
+        elif model == 'hrrr':
+            if hrrr_hour_middle is True:
+                # clear sky index at top of the hour, hrrr is instantaneous
+                times = df.index
+                sp = pvlib.solarposition.ephemeris(
+                    times,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation = sp['apparent_elevation']
+                cs = pvlib.clearsky.simplified_solis(
+                    apparent_elevation,
+                    **model_cs_kwargs
+                )
+                df['ghi_csi'] = df['ghi'] / cs['ghi']
+                df['dni_csi'] = df['dni'] / cs['dni']
+                # clip at max csi
+                df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+                df['dni_csi'] = df['dni_csi'].clip(upper=max_csi)
+                # avoid divide by zero issues
+                df.loc[df['ghi'] == 0, 'ghi_csi'] = 0
+                df.loc[df['dni'] == 0, 'dni_csi'] = 0
+
+                # calculate 1min interpolated temp_air, wind_speed, csi
+                df_01min = (
+                    df[['temp_air', 'wind_speed', 'wind_direction', 'ghi_csi',
+                        'dni_csi', 'lead_time']]
+                    .resample('1min', offset='30s', closed='left')
+                    .interpolate(method='time')
+                )[1:]  # drop first row, which is NaNs
+                # add ghi_clear
+                df_01min['ghi_clear'] = cs_1min['ghi']
+                df_01min['dni_clear'] = cs_1min['dni']
+                # calculate n-min averages centered labeled at bottom of the
+                # interval
+                df_n_min = df_01min.resample(f'{output_interval}min').mean()
+                df_n_min.index = (df_n_min.index +
+                                  pd.Timedelta(f'{output_interval/2}min'))
+                # calculate new ghi
+                df_n_min['ghi'] = df_n_min['ghi_csi'] * df_n_min['ghi_clear']
+                df_n_min['dni'] = df_n_min['dni_csi'] * df_n_min['dni_clear']
+            else:
+                df_n_min = df[['ghi', 'dni', 'temp_air', 'wind_speed',
+                               'wind_direction', 'lead_time']]
+
+            # calculate dhi from ghi, dni, solar position
+            sp = pvlib.solarposition.ephemeris(
+                    df_n_min.index,
+                    loc.latitude,
+                    loc.longitude
+                )
+            cos_zenith = np.maximum(np.cos(np.deg2rad(sp['apparent_zenith'])),
+                                    min_cos_zenith)
+            df_n_min['dhi'] = (df_n_min['ghi'] -
+                               (df_n_min['dni'] * cos_zenith))
+
+            # add clearsky ghi
+            apparent_elevation = sp['apparent_elevation']
+            cs = pvlib.clearsky.simplified_solis(
+                apparent_elevation,
+                **model_cs_kwargs
+            )
+            df_n_min['ghi_clear'] = cs['ghi']
+            df_n_min['dni_clear'] = cs['dni']
+
+            dfs[j] = df_n_min
+
+    # concatenate creating multiindex with keys of the list of point numbers
+    # assigned to 'point', reorder indices, and sort by valid_time
+    df_n_min = (
+        pd.concat(dfs, keys=list(range(num_sites)), names=['point'])
+        .reorder_levels(["valid_time", "point"])
+        .sort_index(level='valid_time')
+    )
+
+    # set "point" index as a column
+    df_n_min = df_n_min.reset_index().set_index('valid_time')
+
+    # drop unneeded columns if they exist
+    df_n_min = df_n_min.drop(['t2m', 'sdswrf'], axis=1, errors='ignore')
+
+    return df_n_min
+
+
+def get_solar_forecast_fast(latitude, longitude, init_date, run_length,
+                            lead_time_to_start=0, model='gfs', member=None,
+                            attempts=2, hrrr_hour_middle=None,
+                            hrrr_coarsen_window=None, priority=None,
+                            decomp_model=None, output_interval=60,
+                            remove_gribs=False):
+    """
+    Get a solar resource forecast for one or several sites from one of several
+    NWPs. This function uses Herbie [1]_ and pvlib [2]_. This version
+    uses FastHerbie and may be about 15% faster. It currently only works
+    with a single init_date, not a list of dates like FastHerbie can use.
+
+    Parameters
+    ----------
+    latitude : float or list of floats
+        Latitude in decimal degrees. Positive north of equator, negative
+        to south.
+
+    longitude : float or list of floats
+        Longitude in decimal degrees. Positive east of prime meridian,
+        negative to west.
+
+    init_date : pandas-parsable datetime
+        Model initialization datetime. Note that this should be UTC and on the
+        hour for the models currently available with hefty, and most models
+        don't initialize every hour. See
+        :py:func:`hefty.utilities.adjust_forecast_datetimes` for help
+        determining appropriate init_date values.
+
+    run_length : int
+        Length of the forecast in hours - number of hours forecasted
+
+    lead_time_to_start : int, optional
+        Number of hours between init_date (initialization) and
+        the first forecasted interval. NOAA GFS data goes out
+        384 hours, so run_length + lead_time_to_start must be less
+        than or equal to 384.
+
+    model : string, default 'gfs'
+        Forecast model. Default is NOAA GFS ('gfs'), but can also be ECMWF IFS
+        single ('ifs'), ECMWF AIFS single ('aifs'), NOAA HRRR ('hrrr'), or
+        NOAA GEFS ('gefs') (a single member from the ensemble). ECMWF CAMS
+        ('cams') is NOT available with this function. For CAMS access, see
+        :py:func:`hefty.solar.get_solar_forecast`.
+
+    member: string or int, default 'avg'
+        For models that are ensembles pass an appropriate single member label.
+        See Herbie documentation for details [1]_. Options for GEFS include
+        'avg' or 'mean' (the ensemble mean), 0 or 'c00' (control member), and
+        1-30 or 'p01'-'p30' for the 30 individual members.
+
+    attempts : int, optional
+        Number of times to try getting forecast data. The function will pause
+        for n^2 minutes after each n attempt, e.g., 1 min after the first
+        attempt, 4 minutes after the second, etc.
+
+    hrrr_hour_middle : bool or None, default True
+        If model is 'hrrr', setting this False keeps the forecast at the
+        native instantaneous top-of-hour format. True (default) shifts
+        the forecast to middle of the hour, more closely representing an
+        integrated hourly forecast that is centered in the middle of the
+        hour.
+
+    hrrr_coarsen_window : int or None, default None
+        If model is 'hrrr', optional setting that is the x and y window size
+        for coarsening the xarray dataset, effectively applying spatial
+        smoothing to the HRRR model. The HRRR has a native resolution of
+        about 3 km, so a value of 10 results in approx. 30 x 30 km grid.
+
+    priority : list or string
+        List of model sources to get the data in the order of download
+        priority, or string for a single source. See Herbie docs.
+        Typical values would be 'aws' or 'google'.
+
+    decomp_model : string, optional
+        Decomposition model to use for forecast models that don't include DNI.
+        Options include 'dirindex' and 'erbs'. Note that HRRR and CAMS include
+        DNI, so this parameter does not apply to those models.
+
+    output_interval : numeric, default 60
+        Interval length, in minutes, of intermediate solar calculations and
+        the output interval. Default is 60, but shorter intervals (e.g., 5)
+        could provide benefit due to improved accuracy in decomposition, at
+        the expense of longer computation times. Must be a factor of 60.
+
+    remove_gribs : bool, default False
+        Remove grib and index files after downloading and processing them.
+        Note that directory structure will remain. Does not do anything
+        if priority='dynamical'.
+
+    Returns
+    -------
+    data : pandas.DataFrane
+        timeseries forecasted solar resource data
+
+    References
+    ----------
+
+    .. [1] `Blaylock, B. K. (YEAR). Herbie: Retrieve Numerical Weather
+        Prediction Model Data (Version 20xx.x.x) [Computer software].
+        <https://doi.org/10.5281/zenodo.4567540>`_
+    .. [2] `Anderson, K., et al. “pvlib python: 2023 project update.” Journal
+        of Open Source Software, 8(92), 5994, (2023).
+        <http://dx.doi.org/10.21105/joss.05994>`_
+    """
+
+    # set clear sky model. could be an input variable at some point
+    # model_cs = 'simplified_solis'
+    model_cs_kwargs = {
+        'aod700': 0.05,
+        'precipitable_water': 0.5,
+    }
+    # minimum cosine of zenith, same default used in pvlib.irradiance
+    # functions. Could be an input variable at some point
+    min_cos_zenith = 0.065
+    # maximum csi
+    max_csi = 1.5
+
+    # variable formatting
+    # if lat, lon are single values, convert to lists for pickpoints later
+    if type(latitude) is float or type(latitude) is int:
+        latitude = [latitude]
+        longitude = [longitude]
+    num_sites = len(latitude)
+    # convert init_date to datetime
+    init_date = pd.to_datetime(init_date)
+
+    # CHECK INPUTS
+    # check model
+    if model not in {'hrrr', 'gfs', 'gefs', 'ifs', 'ifs_ens',
+                     'aifs', 'aifs_ens', 'cams'}:
+        raise ValueError(f'model="{model}" is not compatible with this'
+                         ' function.')
+    # check if init_date is top of hour
+    if init_date != init_date.floor('1h'):
+        raise ValueError(f'init_date must be on the hour, e.g., '
+                         f'{init_date.floor('1h')}, not {init_date}. '
+                         'Consider using init_date.floor("1h") or '
+                         'similar')
+    # check decomp for models that don't need it
+    if decomp_model is not None and model in ['hrrr', 'cams']:
+        warnings.warn(f'model={model} does not require decomposition, but you '
+                      f'entered decomp_model="{decomp_model}". This will not '
+                      'do anything.')
+    # hrrr parameters for models other than hrrr
+    if hrrr_hour_middle is not None and model != 'hrrr':
+        warnings.warn(f'You entered hrrr_hour_middle=False, which does not '
+                      f'apply to the model you entered, "{model}". This will '
+                      'not do anything.')
+    if hrrr_coarsen_window is not None and model != 'hrrr':
+        warnings.warn(f'You entered hrrr_coarsen_window={hrrr_coarsen_window},'
+                      f' which does not apply to the model you entered, '
+                      f'"{model}". This will not do anything.')
+    # cams with priority
+    if model == 'cams' and priority is not None:
+        warnings.warn(f'You entered model="cams" and priority={priority}. CAMS'
+                      ' IFS is accessed via CAMS/CDS by default and '
+                      f'the input priority={priority} will be ignored.')
+    # member but not an ensemble
+    if model not in ['ifs_ens', 'aifs_ens', 'gefs'] and member is not None:
+        warnings.warn(f'You entered member={member} and model={model}, but '
+                      f'{model} is not an ensemble and does not have members.'
+                      f'The input member={member} will be ignored.')
+
+    # fill in defaults as needed
+    if model in ['ifs_ens', 'aifs_ens', 'gefs'] and member is None:
+        member = 'avg'
+    if model == 'hrrr' and hrrr_hour_middle is None:
+        hrrr_hour_middle = True
+    if model not in ['hrrr', 'cams'] and decomp_model is None:
+        decomp_model = 'dirindex'
+
+    # get model-specific Herbie inputs
+    date, fxx_range, product, search_str = model_input_formatter(
+        init_date, run_length, lead_time_to_start, model,
+        resource_type='solar', member=member)
+
+    df_temp = get_fcast_dataframe(
+        latitude, longitude, date, fxx_range, model,
+        search_str, priority, product=product,
+        fast=True, attempts=attempts,
+        resource_type='solar',
+        member=member, hrrr_coarsen_window=hrrr_coarsen_window,
+        remove_gribs=remove_gribs
+    )
+
+    # work through sites
+    dfs = {}  # empty list of dataframes
+    for j in range(num_sites):
+        df = df_temp[df_temp['point'] == j]
+
+        loc = pvlib.location.Location(
+            latitude=latitude[j],
+            longitude=longitude[j],
+            tz=df.index.tz
+            )
+
+        # make 1min interval clear sky data covering our time range
+        times_1min = pd.date_range(
+            start=df.index[0]+pd.Timedelta('30s'),
+            end=df.index[-1]-pd.Timedelta('30s'),
+            freq='1min',
+            tz='UTC')
+        # calculate clear sky ghi with pvlib
+        sp_1min = pvlib.solarposition.ephemeris(
+            times_1min,
+            loc.latitude,
+            loc.longitude
+        )
+        apparent_elevation_1min = sp_1min['apparent_elevation']
+        cs_1min = pvlib.clearsky.simplified_solis(
+            apparent_elevation_1min,
+            **model_cs_kwargs
+        )
+
+        if model in {'gfs', 'gefs'}:
+            # for gfs and gefs ghi: we have to "unmix" the rolling average
+            # irradiance that resets every 6 hours
+            mixed = df[['sdswrf']].copy()
+            mixed['hour'] = mixed.index.hour
+            mixed['hour_of_mixed_period'] = ((mixed['hour'] - 1) % 6) + 1
+            mixed['sdswrf_prev'] = mixed['sdswrf'].shift(
+                periods=1,
+                fill_value=0
+                )
+            mixed['int_len'] = mixed.index.diff().total_seconds().values / 3600
+
+            # set the first interval length:
+            if model == 'gfs' and lead_time_to_start >= 120:
+                mixed.loc[mixed.index[0], 'int_len'] = 1
+            else:
+                mixed.loc[mixed.index[0], 'int_len'] = 3
+            unmixed = ((mixed['hour_of_mixed_period'] * mixed['sdswrf']
+                        - (mixed['hour_of_mixed_period'] - mixed['int_len'])
+                        * mixed['sdswrf_prev']) / mixed['int_len'])
+            # clip to avoid occasional small negative ghi in GEFS, see GH #35
+            df['ghi'] = unmixed.clip(lower=0)
+
+        elif model in ['ifs', 'ifs_ens', 'aifs', 'aifs_ens']:
+            # for ifs ghi: cumulative J/m^s to average W/m^2 over the interval
+            # ending at the valid time. calculate difference in measurement
+            # over diff in time to get avg J/s/m^2 = W/m^2
+            if priority == 'dynamical':
+                df['ghi'] = df['sdswrf']
+            else:
+                df['ghi'] = (df['sdswrf'].diff() /
+                             df.index.diff().seconds.values)
+
+        elif model == 'hrrr':
+            df['ghi'] = df['sdswrf']
+            df['dni'] = df['vbdsf']
+
+        if model in {'gfs', 'gefs', 'ifs', 'ifs_ens', 'aifs', 'aifs_ens'}:
+            # calculate average CS ghi over the intervals from the forecast
+            # based on list comprehension example in
+            # https://stackoverflow.com/a/55724134/27574852
+            ghi = cs_1min['ghi']
+            dates = df.index
+            ghi_clear = [
+                ghi.loc[(ghi.index > dates[i]) & (ghi.index <= dates[i+1])]
+                .mean() for i in range(len(dates) - 1)
+                ]
+
+            # write to df and calculate clear sky index of ghi
+            df['ghi_clear'] = [np.nan] + ghi_clear
+
+            # calculate clear sky index of ghi, dni
+            df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+            # clip at max csi
+            df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+
+            # avoid divide by zero issues
+            df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+
+            # n-min version of data, centered at bottom of the interval
+            new_index = pd.date_range(df.index.min(),
+                                      df.index.max(),
+                                      freq=f'{output_interval/2}min',
+                                      name='valid_time')
+            cols = ['temp_air', 'wind_speed', 'wind_direction',
+                    'lead_time']
+            df_interp = df[cols].reindex(
+                new_index).interpolate(method='time')
+            df_n_min = df_interp.iloc[1::2]
+
+            # "backfill" ghi csi
+            # merge based on nearest index from n-min version looking forward
+            # in 3hr version
+            df_n_min = pd.merge_asof(
+                left=df_n_min,
+                right=df['ghi_csi'],
+                on='valid_time',
+                direction='forward'
+            ).set_index('valid_time')
+
+            # make n-min interval clear sky centered at bottom of the interval
+            if output_interval == 1:
+                times_n_min = times_1min
+                sp_n_min = sp_1min
+                cs_n_min = cs_1min
+            else:
+                times_n_min = pd.date_range(
+                    start=df.index[0]+pd.Timedelta(output_interval/2, 'min'),
+                    end=df.index[-1]-pd.Timedelta(output_interval/2, 'min'),
+                    freq=f'{output_interval}min',
+                    tz='UTC')
+
+                # calculate clear sky ghi with pvlib
+                sp_n_min = pvlib.solarposition.ephemeris(
+                    times_n_min,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation_n_min = sp_n_min['apparent_elevation']
+                cs_n_min = pvlib.clearsky.simplified_solis(
+                    apparent_elevation_n_min,
+                    **model_cs_kwargs
+                )
+
+            # calculate ghi from clear sky and backfilled forecasted clear sky
+            # index
+            df_n_min['ghi'] = cs_n_min['ghi'] * df_n_min['ghi_csi']
+
+            # clip to avoid occasional small negative ghi in GEFS, see GH #35
+            df_n_min['ghi'] = df_n_min['ghi'].clip(lower=0)
+
+            # decompose
+            if decomp_model == 'erbs':
+                out_erbs = pvlib.irradiance.erbs(
+                    df_n_min['ghi'],
+                    sp_n_min['zenith'],
+                    df_n_min.index,
+                )
+                df_n_min['dni'] = out_erbs['dni']
+                df_n_min['dhi'] = out_erbs['dhi']
+            elif decomp_model == 'dirindex':
+                cs_decomp = cs_n_min  # could later use a different cs model...
+                decomp = pvlib.irradiance.dirindex(
+                    ghi=df_n_min['ghi'],
+                    ghi_clear=cs_decomp['ghi'],
+                    dni_clear=cs_decomp['dni'],
+                    zenith=sp_n_min['zenith'],
+                    times=times_n_min,
+                )
+                df_n_min['dni'] = decomp.fillna(0)
+                cos_zenith = np.maximum(
+                    np.cos(np.deg2rad(sp_n_min['apparent_zenith'])),
+                    min_cos_zenith
+                )
+                df_n_min['dhi'] = (df_n_min['ghi'] -
+                                   (df_n_min['dni'] * cos_zenith))
+
+            # add clearsky ghi
+            df_n_min['ghi_clear'] = df_n_min['ghi'] / df_n_min['ghi_csi']
+
+            dfs[j] = df_n_min
+
+        elif model == 'hrrr':
+            if hrrr_hour_middle is True:
+                # clear sky index at top of the hour, hrrr is instantaneous
+                times = df.index
+                sp = pvlib.solarposition.ephemeris(
+                    times,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation = sp['apparent_elevation']
+                cs = pvlib.clearsky.simplified_solis(
+                    apparent_elevation,
+                    **model_cs_kwargs
+                )
+                df['ghi_csi'] = df['ghi'] / cs['ghi']
+                df['dni_csi'] = df['dni'] / cs['dni']
+                # clip at max csi
+                df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+                df['dni_csi'] = df['dni_csi'].clip(upper=max_csi)
+                # avoid divide by zero issues
+                df.loc[df['ghi'] == 0, 'ghi_csi'] = 0
+                df.loc[df['dni'] == 0, 'dni_csi'] = 0
+
+                # calculate 1min interpolated temp_air, wind_speed, csi
+                df_01min = (
+                    df[['temp_air', 'wind_speed', 'wind_direction', 'ghi_csi',
+                        'dni_csi', 'lead_time']]
+                    .resample('1min', offset='30s', closed='left')
+                    .interpolate(method='time')
+                )[1:]  # drop first row, which is NaNs
+                # add ghi_clear
+                df_01min['ghi_clear'] = cs_1min['ghi']
+                df_01min['dni_clear'] = cs_1min['dni']
+                # calculate n-min averages centered labeled at bottom of the
+                # interval
+                df_n_min = df_01min.resample(f'{output_interval}min').mean()
+                df_n_min.index = (df_n_min.index +
+                                  pd.Timedelta(f'{output_interval/2}min'))
+                # calculate new ghi
+                df_n_min['ghi'] = df_n_min['ghi_csi'] * df_n_min['ghi_clear']
+                df_n_min['dni'] = df_n_min['dni_csi'] * df_n_min['dni_clear']
+            else:
+                df_n_min = df[['ghi', 'dni', 'temp_air', 'wind_speed',
+                               'wind_direction', 'lead_time']]
+
+            # calculate dhi from ghi, dni, solar position
+            sp = pvlib.solarposition.ephemeris(
+                    df_n_min.index,
+                    loc.latitude,
+                    loc.longitude
+                )
+            cos_zenith = np.maximum(np.cos(np.deg2rad(sp['apparent_zenith'])),
+                                    min_cos_zenith)
+            df_n_min['dhi'] = (df_n_min['ghi'] -
+                               (df_n_min['dni'] * cos_zenith))
+
+            # add clearsky ghi
+            apparent_elevation = sp['apparent_elevation']
+            cs = pvlib.clearsky.simplified_solis(
+                apparent_elevation,
+                **model_cs_kwargs
+            )
+            df_n_min['ghi_clear'] = cs['ghi']
+            df_n_min['dni_clear'] = cs['dni']
+
+            dfs[j] = df_n_min
+
+    # concatenate creating multiindex with keys of the list of point numbers
+    # assigned to 'point', reorder indices, and sort by valid_time
+    df_n_min = (
+        pd.concat(dfs, keys=list(range(num_sites)), names=['point'])
+        .reorder_levels(["valid_time", "point"])
+        .sort_index(level='valid_time')
+    )
+
+    # set "point" index as a column
+    df_n_min = df_n_min.reset_index().set_index('valid_time')
+
+    # drop unneeded columns if they exist
+    df_n_min = df_n_min.drop(['t2m', 'sdswrf'], axis=1, errors='ignore')
+
+    return df_n_min
+
+
+def get_solar_forecast_ensemble_subset(
+        latitude, longitude, init_date, run_length, lead_time_to_start=0,
+        model='ifs_ens', attempts=2, num_members=3, priority=None,
+        decomp_model='dirindex'):
+    """
+    Get solar resource forecasts for one or several sites using a subset of
+    ensemble members. Use `get_solar_forecast_ensemble` for all ensemble
+    members, or anything over about 25% of members, as it is about 4x
+    faster per member. This function uses Herbie's FastHerbie [1]_ and pvlib
+    [2]_. It currently only works with a single init_date, not a list of dates
+    like FastHerbie can use. Temperature data comes from the ensemble mean,
+    and wind speed is currently just a filler value of 2 m/s to save time.
+
+    Parameters
+    ----------
+    latitude : float or list of floats
+        Latitude in decimal degrees. Positive north of equator, negative
+        to south.
+
+    longitude : float or list of floats
+        Longitude in decimal degrees. Positive east of prime meridian,
+        negative to west.
+
+    init_date : pandas-parsable datetime
+        Model initialization datetime. Note that this should be UTC and on the
+        hour for the models currently available with hefty, and most models
+        don't initialize every hour. See
+        :py:func:`hefty.utilities.adjust_forecast_datetimes` for help
+        determining appropriate init_date values.
+
+    run_length : int
+        Length of the forecast in hours - number of hours forecasted
+
+    lead_time_to_start : int, optional
+        Number of hours between init_date (initialization) and
+        the first forecasted interval.
+
+    model : string, default 'ifs_ens'
+        Forecast model. Default and only option is ECMWF IFS Ensemble
+        ('ifs_ens'). NOAA GEFS may be added in the future.
+
+    attempts : int, optional
+        Number of times to try getting forecast data. The function will pause
+        for n^2 minutes after each n attempt, e.g., 1 min after the first
+        attempt, 4 minutes after the second, etc.
+
+    num_members : int, default 3
+        Number of ensemble members to get. IFS has 50 members.
+
+    priority : list or string
+        List of model sources to get the data in the order of download
+        priority, or string for a single source. See Herbie docs.
+        Typical values would be 'aws' or 'google'.
+
+    decomp_model : string, optional
+        Decomposition model to use. Options include 'dirindex' and 'erbs'.
+
+    Returns
+    -------
+    data : pandas.DataFrane
+        timeseries forecasted solar resource data
+
+    References
+    ----------
+
+    .. [1] `Blaylock, B. K. (YEAR). Herbie: Retrieve Numerical Weather
+        Prediction Model Data (Version 20xx.x.x) [Computer software].
+        <https://doi.org/10.5281/zenodo.4567540>`_
+    .. [2] `Anderson, K., et al. “pvlib python: 2023 project update.” Journal
+        of Open Source Software, 8(92), 5994, (2023).
+        <http://dx.doi.org/10.21105/joss.05994>`_
+    """
+
+    # set clear sky model. could be an input variable at some point
+    # model_cs = 'simplified_solis'
+    model_cs_kwargs = {
+        'aod700': 0.05,
+        'precipitable_water': 0.5,
+    }
+    # minimum cosine of zenith, same default used in pvlib.irradiance
+    # functions. Could be an input variable at some point
+    min_cos_zenith = 0.065
+    # maximum csi
+    max_csi = 1.5
+
+    # check model
+    if model.casefold() != ('ifs_ens').casefold():
+        raise ValueError('model must be ifs_ens, you entered ' + model)
+
+    model_herbie = 'ifs'  # this is the model name Herbie uses
+
+    # variable formatting
+    # if lat, lon are single values, convert to lists for pickpoints later
+    if type(latitude) is float or type(latitude) is int:
+        latitude = [latitude]
+        longitude = [longitude]
+    num_sites = len(latitude)
+    # convert init_date to datetime
+    init_date = pd.to_datetime(init_date)
+
+    # check if init_date is top of hour
+    if init_date != init_date.floor('1h'):
+        raise ValueError(f'init_date must be on the hour, e.g., '
+                         f'{init_date.floor('1h')}, not {init_date}. '
+                         'Consider using init_date.floor("1h") or '
+                         'similar')
+
+    # get model-specific Herbie inputs, except product and search string,
+    # which are unique for the ensemble
+    init_date, fxx_range, _, _ = model_input_formatter(
+        init_date, run_length, lead_time_to_start, model, full_ens=True)
+
+    dfs = []
+
+    # loop through IFS ensemble members and get GHI data
+    for number in range(1, num_members+1):
+        search_str = ':ssrd:sfc:' + str(number) + ':'
+        # try n times based loosely on
+        # https://thingspython.wordpress.com/2021/12/05/how-to-try-something-n-times-in-python/
+        for attempts_remaining in reversed(range(attempts)):
+            attempt_num = attempts - attempts_remaining
+            try:
+                if attempt_num == 1:
+                    # try downloading
+                    ds = FastHerbie(DATES=[init_date],
+                                    model=model_herbie,
+                                    product='enfo',
+                                    fxx=fxx_range,
+                                    priority=priority).xarray(search_str)
+                else:
+                    # after first attempt, set overwrite=True to overwrite
+                    # partial files
+                    ds = FastHerbie(DATES=[init_date],
+                                    model=model_herbie,
+                                    product='enfo',
+                                    fxx=fxx_range,
+                                    priority=priority).xarray(search_str,
+                                                              overwrite=True)
+            except Exception as e:
+                print(e)
+                if attempts_remaining:
+                    print('attempt ' + str(attempt_num) + ' failed, pause for '
+                          + str((attempt_num)**2) + ' min')
+                    time.sleep(60*(attempt_num)**2)
+                else:
+                    raise ValueError(f'download failed, ran out of attempts '
+                                     f'with error: {e}')
+            else:
+                break
+
+        # use pick_points for single point or list of points
+        ds2 = ds.herbie.pick_points(pd.DataFrame({
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        }))
+        # convert to dataframe
+        df_temp = (ds2
+                   .to_dataframe()
+                   .reset_index()
+                   .set_index('valid_time')[['point', 'ssrd']])
+        # add timezone
+        df_temp = df_temp.tz_localize('UTC', level='valid_time')
+        # rename ssrd
+        df_temp = df_temp.rename(columns={'ssrd': 'sdswrf'})
+
+        # work through sites (points)
+        for point in range(num_sites):
+            df = df_temp[df_temp['point'] == point].copy()
+
+            loc = pvlib.location.Location(
+                latitude=latitude[point],
+                longitude=longitude[point],
+                tz=df.index.tz
+                )
+
+            # convert cumulative J/m^s to average W/m^2
+            df['ghi'] = df['sdswrf'].diff() / df.index.diff().seconds.values
+
+            # make 1min interval clear sky data covering our time range
+            times = pd.date_range(
+                start=df.index[0]+pd.Timedelta('30s'),
+                end=df.index[-1]-pd.Timedelta('30s'),
+                freq='1min',
+                tz='UTC')
+
+            # calculate clear sky ghi with pvlib
+            sp = pvlib.solarposition.ephemeris(
+                times,
+                loc.latitude,
+                loc.longitude
+            )
+            apparent_elevation = sp['apparent_elevation']
+            cs = pvlib.clearsky.simplified_solis(
+                apparent_elevation,
+                **model_cs_kwargs
+            )
+
+            # calculate average CS ghi over the intervals from the forecast
+            # based on list comprehension example in
+            # https://stackoverflow.com/a/55724134/27574852
+            ghi = cs['ghi']
+            dates = df.index
+            ghi_clear = [
+                ghi.loc[(ghi.index > dates[i]) & (ghi.index <= dates[i+1])]
+                .mean() for i in range(len(dates) - 1)
+                ]
+
+            # write to df and calculate clear sky index of ghi
+            df['ghi_clear'] = [np.nan] + ghi_clear
+            df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+            # clip at max csi
+            df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+
+            # avoid divide by zero issues
+            df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+
+            # make a dummy column
+            df['dummy'] = 0
+
+            # 60min version of data, centered at bottom of the hour
+            # 1min interpolation, then 60min mean
+            df_60min = (
+                df['dummy']
+                .resample('1min')
+                .interpolate(method='time')
+                .resample('60min').mean()
+            )
+            # make timestamps center-labeled for instantaneous pvlib modeling
+            # later
+            df_60min.index = df_60min.index + pd.Timedelta('30min')
+            # drop last row, since we don't have data for the last full hour
+            # (just an instantaneous end point)
+            df_60min = df_60min.iloc[:-1]
+            # "backfill" ghi csi
+            # merge based on nearest index from 60min version looking forward
+            # in 3hr version
+            df_60min = pd.merge_asof(
+                left=df_60min,
+                right=df.ghi_csi,
+                on='valid_time',
+                direction='forward'
+            ).set_index('valid_time')
+
+            # make 60min interval clear sky, centered at bottom of the hour
+            times = pd.date_range(
+                start=df.index[0]+pd.Timedelta('30m'),
+                end=df.index[-1]-pd.Timedelta('30m'),
+                freq='60min',
+                tz='UTC')
+
+            # calculate clear sky ghi with pvlib
+            sp = pvlib.solarposition.ephemeris(
+                times,
+                loc.latitude,
+                loc.longitude
+            )
+            apparent_elevation = sp['apparent_elevation']
+            cs = pvlib.clearsky.simplified_solis(
+                apparent_elevation,
+                **model_cs_kwargs
+            )
+
+            # calculate ghi from clear sky and backfilled forecasted clear sky
+            # index
+            df_60min['ghi'] = cs['ghi'] * df_60min['ghi_csi']
+
+            # clip to avoid occasional small negative ghi in GEFS, see GH #35
+            df_60min['ghi'] = df_60min['ghi'].clip(lower=0)
+
+            # decompose
+            if decomp_model == 'erbs':
+                out_erbs = pvlib.irradiance.erbs(
+                    df_60min['ghi'],
+                    sp['zenith'],
+                    df_60min.index,
+                )
+                df_60min['dni'] = out_erbs['dni']
+                df_60min['dhi'] = out_erbs['dhi']
+            elif decomp_model == 'dirindex':
+                cs_decomp = cs  # could later use a different cs model...
+                decomp = pvlib.irradiance.dirindex(
+                    ghi=df_60min['ghi'],
+                    ghi_clear=cs_decomp['ghi'],
+                    dni_clear=cs_decomp['dni'],
+                    zenith=sp['zenith'],
+                    times=times,
+                )
+                df_60min['dni'] = decomp.fillna(0)
+                cos_zenith = np.maximum(
+                    np.cos(np.deg2rad(sp['apparent_zenith'])),
+                    min_cos_zenith
+                )
+                df_60min['dhi'] = (df_60min['ghi'] -
+                                   (df_60min['dni'] * cos_zenith))
+
+            # add clearsky ghi
+            df_60min['ghi_clear'] = df_60min['ghi'] / df_60min['ghi_csi']
+
+            # add member number and point, drop dummy column
+            df_60min['member'] = number
+            df_60min['point'] = point
+            df_60min = df_60min.drop(columns=['dummy'])
+
+            # append
+            dfs.append(df_60min)
+
+    # convert to dataframe
+    df_60min_irr = pd.concat(dfs)
+
+    # get deterministic temp_air
+    search_str = ':2t:sfc:g:0001:od:cf:enfo'
+    product = 'enfo'
+    # account for IFS changes starting 2026-05-12 06z
+    if (init_date.tz_localize(None) > pd.to_datetime('2026-05-12')):
+        product = 'oper'
+        search_str = '2t:sfc'
+
+    # try n times based loosely on
+    # https://thingspython.wordpress.com/2021/12/05/how-to-try-something-n-times-in-python/
+    for attempts_remaining in reversed(range(attempts)):
+        attempt_num = attempts - attempts_remaining
+        try:
+            if attempt_num == 1:
+                # try downloading
+                ds = FastHerbie(DATES=[init_date],
+                                model=model_herbie,
+                                product=product,
+                                fxx=fxx_range,
+                                priority=priority).xarray(search_str)
+            else:
+                # after first attempt, set overwrite=True to overwrite
+                # partial files
+                ds = FastHerbie(DATES=[init_date],
+                                model=model_herbie,
+                                product=product,
+                                fxx=fxx_range,
+                                priority=priority).xarray(search_str,
+                                                          overwrite=True)
+        except Exception as e:
+            print(e)
+            if attempts_remaining:
+                print('attempt ' + str(attempt_num) + ' failed, pause for '
+                      + str((attempt_num)**2) + ' min')
+                time.sleep(60*(attempt_num)**2)
+            else:
+                raise ValueError(f'download failed, ran out of attempts '
+                                 f'with error: {e}')
+        else:
+            break
+
+    # use pick_points for single point or list of points
+    ds2 = ds.herbie.pick_points(pd.DataFrame({
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    }))
+
+    # convert to dataframe
+    df_temp = (ds2
+               .to_dataframe()
+               .reset_index()
+               .set_index('valid_time')[['point', 't2m']])
+    # add timezone
+    df_temp = df_temp.tz_localize('UTC', level='valid_time')
+
+    # convert air temperature units
+    df_temp['temp_air'] = df_temp['t2m'] - 273.15
+
+    dfs_temp_air = []
+    # work through sites (points)
+    if type(latitude) is float or type(latitude) is int:
+        num_sites = 1
+    else:
+        num_sites = len(latitude)
+    for point in range(num_sites):
+        df = df_temp[df_temp['point'] == point].copy()
+
+        # 60min version of data, centered at bottom of the hour
+        # 1min interpolation, then 60min mean
+        df_60min_temp_air = (
+            df[['temp_air']]
+            .resample('1min')
+            .interpolate(method='time')
+            .resample('60min').mean()
+        )
+
+        # make timestamps center-labeled for instantaneous pvlib modeling
+        # later
+        df_60min_temp_air.index = df_60min_temp_air.index + \
+            pd.Timedelta('30min')
+        # drop last row, since we don't have data for the last full hour
+        # (just an instantaneous end point)
+        df_60min_temp_air = df_60min_temp_air.iloc[:-1]
+
+        # drop unneeded columns if they exist
+        df_60min_temp_air = df_60min_temp_air.drop(['t2m'],
+                                                   axis=1,
+                                                   errors='ignore')
+
+        # add member number and point, drop dummy column
+        # df_60min_temp_air['member'] = pd.NA
+        df_60min_temp_air['point'] = point
+
+        # append
+        dfs_temp_air.append(df_60min_temp_air)
+
+    # concat
+    df_60min_temp_air = pd.concat(dfs_temp_air)
+
+    # final merge
+    df_60min = pd.merge(df_60min_irr,
+                        df_60min_temp_air,
+                        on=['valid_time', 'point'])
+
+    # add generic wind
+    df_60min['wind_speed'] = 2
+    df_60min['wind_direction'] = 0
+
+    return df_60min
+
+
+def get_solar_forecast_ensemble(latitude, longitude, init_date, run_length,
+                                lead_time_to_start=0, model='ifs_ens',
+                                attempts=2, priority=None,
+                                get_ens_temp=False, get_ens_wind=False,
+                                decomp_model='dirindex', output_interval=60,
+                                remove_gribs=False):
+    """
+    Get solar resource forecasts for one or several sites using all ensemble
+    members. Using `get_solar_forecast_ensemble_subset` may be fast for a
+    small subset of ensemble members, e.g., much less that 25% of members.
+    This function uses Herbie's FastHerbie [1]_ and pvlib [2]_. It currently
+    only works with a single init_date, not a list of dates like FastHerbie
+    can use. If input `get_ens_temp` is False (default), then temperature
+    data comes from the ensemble mean for GEFS, the control member for IFS
+    (mean is available and could be used in the future), and the first member
+    for AIFS (mean and control do not seem to be available). If
+    `get_ens_temp` is True, temperatures come from each ensemble member. If
+    `get_ens_wind` is False (default), wind speed is just a filler value of 2
+    m/s to save time. If `get_ens_wind` is True, temperatures come from each
+    ensemble member.
+
+    Parameters
+    ----------
+    latitude : float or list of floats
+        Latitude in decimal degrees. Positive north of equator, negative
+        to south.
+
+    longitude : float or list of floats
+        Longitude in decimal degrees. Positive east of prime meridian,
+        negative to west.
+
+    init_date : pandas-parsable datetime
+        Model initialization datetime. Note that this should be UTC and on the
+        hour for the models currently available with hefty, and most models
+        don't initialize every hour. See
+        :py:func:`hefty.utilities.adjust_forecast_datetimes` for help
+        determining appropriate init_date values.
+
+    run_length : int
+        Length of the forecast in hours - number of hours forecasted
+
+    lead_time_to_start : int, optional
+        Number of hours between init_date (initialization) and
+        the first forecasted interval.
+
+    model : string, default 'ifs_ens'
+        Forecast model. Can be ECMWF IFS Ensemble ('ifs_ens'), ECMWF AIFS
+        Ensemble ('aifs_ens'), or NOAA GEFS ('gefs').
+
+    attempts : int, optional
+        Number of times to try getting forecast data. The function will pause
+        for n^2 minutes after each n attempt, e.g., 1 min after the first
+        attempt, 4 minutes after the second, etc.
+
+    priority : list or string
+        List of model sources to get the data in the order of download
+        priority, or string for a single source. Use 'dynamical' for
+        dynamical.org as a rouce. See Herbie docs for other options.
+        Typical values for Herbie would be 'google', 'azure', or 'aws'.
+
+    get_ens_temp : bool, default False
+        Get air temperature from each ensemble member if `True`. Otherwise,
+        if `False` (default), get air temperature from the control member and
+        use it for all forecasts. Setting to `True` approximately doubles the
+        amount of data and the time needed to download and process it. Must
+        be `True` if `get_ens_wind` is `True`.
+
+    get_ens_wind : bool, default False
+        Get wind speed from each ensemble member if `True`. Otherwise, if
+        `False` (default), wind speed is a generic 2 m/s value to save time.
+
+    decomp_model : string, default 'dirindex'
+        Decomposition model to use. Options include 'dirindex' and 'erbs'.
+
+    output_interval : numeric, default 60
+        Interval length, in minutes, of intermediate solar calculations and
+        the output interval. Default is 60, but shorter intervals (e.g., 5)
+        could provide benefit due to improved accuracy in decomposition, at
+        the expense of longer computation times. Must be a factor of 60.
+
+    remove_gribs : bool, default False
+        Remove grib and index files after downloading and processing them.
+        Note that directory structure will remain. Does not do anything
+        if priority='dynamical'.
+
+    Returns
+    -------
+    data : pandas.DataFrane
+        timeseries forecasted solar resource data
+
+    References
+    ----------
+
+    .. [1] `Blaylock, B. K. (YEAR). Herbie: Retrieve Numerical Weather
+        Prediction Model Data (Version 20xx.x.x) [Computer software].
+        <https://doi.org/10.5281/zenodo.4567540>`_
+    .. [2] `Anderson, K., et al. “pvlib python: 2023 project update.” Journal
+        of Open Source Software, 8(92), 5994, (2023).
+        <http://dx.doi.org/10.21105/joss.05994>`_
+    """
+
+    # set clear sky model. could be an input variable at some point
+    # model_cs = 'simplified_solis'
+    model_cs_kwargs = {
+        'aod700': 0.05,
+        'precipitable_water': 0.5,
+    }
+    # minimum cosine of zenith, same default used in pvlib.irradiance
+    # functions. Could be an input variable at some point
+    min_cos_zenith = 0.065
+    # maximum csi
+    max_csi = 1.5
+
+    # check model
+    if (
+        model.casefold() != ('ifs_ens').casefold() and
+        model.casefold() != ('aifs_ens').casefold() and
+        model.casefold() != ('gefs').casefold()
+    ):
+        raise ValueError(('model must be ifs_ens, aifs_ens, or gefs, you '
+                          'entered ' + model))
+    # check get_ens_temp/wind
+    if get_ens_wind and not get_ens_temp:
+        raise ValueError('if get_ens_wind=True, get_ens_temp must also be '
+                         'True')
+
+    # variable formatting
+    # if lat, lon are single values, convert to lists for pickpoints later
+    if type(latitude) is float or type(latitude) is int:
+        latitude = [latitude]
+        longitude = [longitude]
+    num_sites = len(latitude)
+    # convert init_date to datetime
+    init_date = pd.to_datetime(init_date)
+
+    # check if init_date is top of hour
+    if init_date != init_date.floor('1h'):
+        raise ValueError(f'init_date must be on the hour, e.g., '
+                         f'{init_date.floor('1h')}, not {init_date}. '
+                         'Consider using init_date.floor("1h") or '
+                         'similar')
+
+    # get model-specific Herbie inputs, except product and search string,
+    # which are unique for the ensemble
+    resource_type = 'solar'
+    full_ens = True
+    member = None
+    if priority == 'dynamical':
+        fast = False
+    else:
+        fast = True
+    init_date, fxx_range, product, search_str = model_input_formatter(
+        init_date, run_length, lead_time_to_start, model,
+        resource_type, full_ens, get_ens_temp, get_ens_wind, member)
+
+    # ifs/aifs workflow
+    if model == 'ifs_ens' or model == 'aifs_ens':
+        df_temp = get_fcast_dataframe(
+            latitude, longitude, init_date, fxx_range, model,
+            search_str, priority, product,
+            fast, attempts, resource_type,
+            member, remove_gribs=remove_gribs)
+        # if needed, get search strings that are remaining
+        if not get_ens_temp and not get_ens_wind:
+            # use the control member
+            member_cust = 0
+            _, _, product_cust, search_str_2 = model_input_formatter(
+                    init_date, run_length, lead_time_to_start, model,
+                    resource_type, full_ens=False, get_ens_temp=False,
+                    get_ens_wind=False, member=member_cust)
+            # 2m temperature search string should be second
+            search_str_cust = "|".join(search_str_2.split('|')[1:2])
+            df_rem = get_fcast_dataframe(
+                latitude, longitude, init_date, fxx_range, model,
+                search_str_cust, priority, product_cust,
+                fast, attempts, resource_type,
+                member_cust, remove_gribs=remove_gribs)
+            # merge
+            df_temp = pd.merge(
+                df_temp,
+                df_rem.drop(columns=['lead_time', 'number']),
+                on=['valid_time', 'point'])
+            # add 2 m/s wind speed
+            df_temp['wind_speed'] = 2
+            df_temp['wind_direction'] = 0
+        elif get_ens_temp and not get_ens_wind:
+            # add 2 m/s wind speed
+            df_temp['wind_speed'] = 2
+            df_temp['wind_direction'] = 0
+
+        # work through sites (points) and members
+        member_list = df_temp['number'].unique()
+        dfs = []
+        for point in range(num_sites):
+            # set of timestamps for solar position and clear sky
+            df = df_temp[(df_temp['point'] == point) &
+                         (df_temp['number'] == member_list[0])].copy()
+
+            # location
+            loc = pvlib.location.Location(
+                    latitude=latitude[point],
+                    longitude=longitude[point],
+                    tz=df.index.tz
+                    )
+
+            # make 1min interval clear sky data covering our time range
+            times_1min = pd.date_range(
+                start=df.index[0]+pd.Timedelta('30s'),
+                end=df.index[-1]-pd.Timedelta('30s'),
+                freq='1min',
+                tz='UTC')
+
+            # calculate clear sky ghi with pvlib
+            sp_1min = pvlib.solarposition.ephemeris(
+                times_1min,
+                loc.latitude,
+                loc.longitude
+            )
+            apparent_elevation_1min = sp_1min['apparent_elevation']
+            cs_1min = pvlib.clearsky.simplified_solis(
+                apparent_elevation_1min,
+                **model_cs_kwargs
+            )
+
+            # longer interval clear sky, centered at bottom of the interval
+            times_n_min = pd.date_range(
+                start=df.index[0]+pd.Timedelta(output_interval/2, 'min'),
+                end=df.index[-1]-pd.Timedelta(output_interval/2, 'min'),
+                freq=f'{output_interval}min',
+                tz='UTC')
+
+            # calculate clear sky ghi with pvlib
+            sp_n_min = pvlib.solarposition.ephemeris(
+                times_n_min,
+                loc.latitude,
+                loc.longitude
+            )
+            apparent_elevation_n_min = sp_n_min['apparent_elevation']
+            cs_n_min = pvlib.clearsky.simplified_solis(
+                apparent_elevation_n_min,
+                **model_cs_kwargs
+            )
+
+            for number in member_list:
+                df = df_temp[(df_temp['point'] == point) &
+                             (df_temp['number'] == number)].copy()
+
+                if priority == 'dynamical':
+                    df['ghi'] = df['sdswrf']
+                else:
+                    # convert cumulative J/m^s to average W/m^2
+                    df['ghi'] = (df['sdswrf'].diff() /
+                                 df.index.diff().seconds.values)
+
+                # calculate average CS ghi over the intervals from the forecast
+                # based on list comprehension example in
+                # https://stackoverflow.com/a/55724134/27574852
+                ghi = cs_1min['ghi']
+                dates = df.index
+                ghi_clear = [
+                    ghi.loc[(ghi.index > dates[i]) & (ghi.index <= dates[i+1])]
+                    .mean() for i in range(len(dates) - 1)
+                    ]
+
+                # write to df and calculate clear sky index of ghi
+                df['ghi_clear'] = [np.nan] + ghi_clear
+                df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+                # clip at max csi
+                df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+
+                # avoid divide by zero issues
+                df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+
+                # n-min version of data, centered at bottom of the interval
+                new_index = pd.date_range(df.index.min(),
+                                          df.index.max(),
+                                          freq=f'{output_interval/2}min',
+                                          name='valid_time')
+                cols = ['temp_air', 'wind_speed', 'wind_direction',
+                        'lead_time']
+                df_interp = df[cols].reindex(
+                    new_index).interpolate(method='time')
+                df_n_min = df_interp.iloc[1::2]
+
+                # "backfill" ghi csi
+                # merge based on nearest index from n-min version looking
+                # forward in 3hr version
+                df_n_min = pd.merge_asof(
+                    left=df_n_min,
+                    right=df[['ghi_csi']],
+                    on='valid_time',
+                    direction='forward'
+                ).set_index('valid_time')
+
+                # calculate ghi from clear sky and backfilled forecasted clear
+                # sky index
+                df_n_min['ghi'] = cs_n_min['ghi'] * df_n_min['ghi_csi']
+
+                # decompose
+                if decomp_model == 'erbs':
+                    out_erbs = pvlib.irradiance.erbs(
+                        df_n_min['ghi'],
+                        sp_n_min['zenith'],
+                        df_n_min.index,
+                    )
+                    df_n_min['dni'] = out_erbs['dni']
+                    df_n_min['dhi'] = out_erbs['dhi']
+                elif decomp_model == 'dirindex':
+                    cs_decomp = cs_n_min  # could later use another cs model
+                    decomp = pvlib.irradiance.dirindex(
+                        ghi=df_n_min['ghi'],
+                        ghi_clear=cs_decomp['ghi'],
+                        dni_clear=cs_decomp['dni'],
+                        zenith=sp_n_min['zenith'],
+                        times=times_n_min,
+                    )
+                    df_n_min['dni'] = decomp.fillna(0)
+                    cos_zenith = np.maximum(
+                        np.cos(np.deg2rad(sp_n_min['apparent_zenith'])),
+                        min_cos_zenith
+                    )
+                    df_n_min['dhi'] = (df_n_min['ghi'] -
+                                       (df_n_min['dni'] * cos_zenith))
+
+                # add clearsky ghi
+                df_n_min['ghi_clear'] = df_n_min['ghi'] / df_n_min['ghi_csi']
+
+                # add member number and point, drop dummy column
+                df_n_min['member'] = number
+                df_n_min['point'] = point
+
+                # append
+                dfs.append(df_n_min)
+
+        # convert to dataframe
+        df_n_min_irr = pd.concat(dfs)
+        df_n_min = df_n_min_irr.copy()
+
+    else:  # model == 'gefs':
+        # list of GEFS ensemble members, e.g., 'p01', 'p02', etc.
+        num_members = 30
+        member_list = [f"p{x:02d}" for x in range(1, num_members+1)]
+
+        dfs = []
+        for x in range(0, num_members):
+            df = get_fcast_dataframe(
+                latitude, longitude, init_date, fxx_range, model,
+                search_str, priority, product,
+                fast, attempts, resource_type,
+                member_list[x], remove_gribs=remove_gribs)
+            dfs.append(df)
+        df_merged = pd.concat(dfs)
+        # if needed, get search strings that are remaining
+        if not get_ens_temp and not get_ens_wind:
+            _, _, _, search_str_2 = model_input_formatter(
+                    init_date, run_length, lead_time_to_start, model,
+                    resource_type, full_ens=False, get_ens_temp=False,
+                    get_ens_wind=False, member=0)
+            # 2m temperature search string should be second
+            search_str_cust = "|".join(search_str_2.split('|')[1:2])
+            # use control member
+            member_cust = 0
+            df_rem = get_fcast_dataframe(
+                latitude, longitude, init_date, fxx_range, model,
+                search_str_cust, priority, product,
+                fast, attempts, resource_type,
+                member_cust, remove_gribs=remove_gribs)
+            # merge
+            df_merged = pd.merge(
+                df_merged,
+                df_rem.drop(columns=['lead_time', 'number']),
+                on=['valid_time', 'point'])
+            # add 2 m/s wind speed
+            df_merged['wind_speed'] = 2
+            df_merged['wind_direction'] = 0
+        elif get_ens_temp and not get_ens_wind:
+            # add 2 m/s wind speed
+            df_merged['wind_speed'] = 2
+            df_merged['wind_direction'] = 0
+
+        dfs = []
+        # work back through members
+        for x in range(0, num_members):
+            # work through sites (points) and members
+            for point in range(num_sites):
+                df = df_merged[(df_merged['point'] == point) &
+                               (df_merged['number'] == x+1)].copy()
+
+                loc = pvlib.location.Location(
+                    latitude=latitude[point],
+                    longitude=longitude[point],
+                    tz=df.index.tz
+                    )
+
+                # for gfs ghi: we have to "unmix" the rolling average
+                # irradiance that resets every 6 hours
+                mixed = df[['sdswrf']].copy()
+                mixed['hour'] = mixed.index.hour
+                mixed['hour_of_mixed_period'] = ((mixed['hour'] - 1) % 6) + 1
+                mixed['sdswrf_prev'] = mixed['sdswrf'].shift(
+                    periods=1,
+                    fill_value=0
+                    )
+                mixed['int_len'] = (mixed.index.diff()
+                                    .total_seconds().values) / 3600
+
+                # set the first interval length:
+                mixed.loc[mixed.index[0], 'int_len'] = 3
+                unmixed = ((mixed['hour_of_mixed_period'] * mixed['sdswrf']
+                           - (mixed['hour_of_mixed_period'] - mixed['int_len'])
+                           * mixed['sdswrf_prev']) / mixed['int_len'])
+                # clip to avoid occasional small negative ghi, see GH #35
+                df['ghi'] = unmixed.clip(lower=0)
+
+                # make 1min interval clear sky data covering our time range
+                times = pd.date_range(
+                    start=df.index[0]+pd.Timedelta('30s'),
+                    end=df.index[-1]-pd.Timedelta('30s'),
+                    freq='1min',
+                    tz='UTC')
+
+                # calculate clear sky ghi with pvlib
+                sp = pvlib.solarposition.ephemeris(
+                    times,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation = sp['apparent_elevation']
+                cs = pvlib.clearsky.simplified_solis(
+                    apparent_elevation,
+                    **model_cs_kwargs
+                )
+
+                # calculate average CS ghi over the intervals from the forecast
+                # based on list comprehension example in
+                # https://stackoverflow.com/a/55724134/27574852
+                ghi = cs['ghi']
+                dates = df.index
+                ghi_clear = [
+                    ghi.loc[(ghi.index > dates[i]) & (ghi.index <= dates[i+1])]
+                    .mean() for i in range(len(dates) - 1)
+                    ]
+
+                # write to df and calculate clear sky index of ghi
+                df['ghi_clear'] = [np.nan] + ghi_clear
+                df['ghi_csi'] = df['ghi'] / df['ghi_clear']
+                # clip at max csi
+                df['ghi_csi'] = df['ghi_csi'].clip(upper=max_csi)
+
+                # avoid divide by zero issues
+                df.loc[df['ghi_clear'] == 0, 'ghi_csi'] = 0
+
+                # n_min version of data, centered at bottom of the interval
+                new_index = pd.date_range(df.index.min(),
+                                          df.index.max(),
+                                          freq=f'{output_interval/2}min',
+                                          name='valid_time')
+                cols = ['temp_air', 'wind_speed', 'wind_direction',
+                        'lead_time']
+                df_interp = df[cols].reindex(
+                    new_index).interpolate(method='time')
+                df_n_min = df_interp.iloc[1::2]
+
+                # "backfill" ghi csi
+                # merge based on nearest index from _n_min version looking
+                # forward in 3hr version
+                df_n_min = pd.merge_asof(
+                    left=df_n_min,
+                    right=df[['ghi_csi']],
+                    on='valid_time',
+                    direction='forward'
+                ).set_index('valid_time')
+
+                # n_min interval clear sky, centered at bottom of the interval
+                times = pd.date_range(
+                    start=df.index[0]+pd.Timedelta(output_interval/2, 'min'),
+                    end=df.index[-1]-pd.Timedelta(output_interval/2, 'min'),
+                    freq=f'{output_interval}min',
+                    tz='UTC')
+
+                # calculate clear sky ghi with pvlib
+                sp = pvlib.solarposition.ephemeris(
+                    times,
+                    loc.latitude,
+                    loc.longitude
+                )
+                apparent_elevation = sp['apparent_elevation']
+                cs = pvlib.clearsky.simplified_solis(
+                    apparent_elevation,
+                    **model_cs_kwargs
+                )
+
+                # calculate ghi from clear sky and backfilled forecasted clear
+                # sky index
+                df_n_min['ghi'] = cs['ghi'] * df_n_min['ghi_csi']
+
+                # clip to avoid occasional small negative ghi in GEFS, GH #35
+                df_n_min['ghi'] = df_n_min['ghi'].clip(lower=0)
+
+                # decompose
+                if decomp_model == 'erbs':
+                    out_erbs = pvlib.irradiance.erbs(
+                        df_n_min['ghi'],
+                        sp['zenith'],
+                        df_n_min.index,
+                    )
+                    df_n_min['dni'] = out_erbs['dni']
+                    df_n_min['dhi'] = out_erbs['dhi']
+                elif decomp_model == 'dirindex':
+                    cs_decomp = cs  # could later use a different cs model...
+                    decomp = pvlib.irradiance.dirindex(
+                        ghi=df_n_min['ghi'],
+                        ghi_clear=cs_decomp['ghi'],
+                        dni_clear=cs_decomp['dni'],
+                        zenith=sp['zenith'],
+                        times=times,
+                    )
+                    df_n_min['dni'] = decomp.fillna(0)
+                    cos_zenith = np.maximum(
+                        np.cos(np.deg2rad(sp['apparent_zenith'])),
+                        min_cos_zenith
+                    )
+                    df_n_min['dhi'] = (df_n_min['ghi'] -
+                                       (df_n_min['dni'] * cos_zenith))
+
+                # add clearsky ghi
+                df_n_min['ghi_clear'] = df_n_min['ghi'] / df_n_min['ghi_csi']
+
+                # add member number and point, drop dummy column
+                df_n_min['member'] = x+1
+                df_n_min['point'] = point
+
+                # append
+                dfs.append(df_n_min)
+
+        # convert to dataframe
+        df_n_min_irr = pd.concat(dfs)
+        df_n_min = df_n_min_irr.copy()
+
+    return df_n_min

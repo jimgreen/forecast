@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: 2026 Contributors to the OpenSTEF project <openstef@lfenergy.org>
+#
+# SPDX-License-Identifier: MPL-2.0
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatchling" ]
+
+[project]
+name = "openstef-deployment-examples"
+version = "0.0.0"
+description = "Runnable deployment examples for OpenSTEF (Dagster, Airflow, Celery)"
+readme = "README.md"
+requires-python = ">=3.12,<4.0"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "openstef-core[benchmark]",
+  "openstef-models[xgb-cpu]",
+  "pydantic-settings>=2.14,<3",
+]
+optional-dependencies.airflow = [ "apache-airflow>=3.2,<4" ]
+optional-dependencies.celery = [
+  "celery[redis]>=5.4",
+]
+optional-dependencies.dagster = [
+  "dagster>=1.9",
+  "dagster-webserver>=1.9",
+]
+
+[tool.hatch]
+build.targets.wheel.packages = [
+  "src/airflow_app",
+  "src/celery_app",
+  "src/common",
+  "src/dagster_app",
+]
+
+[tool.poe]
+include = [ "poe_tasks.toml" ]

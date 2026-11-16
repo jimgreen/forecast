@@ -1,0 +1,262 @@
+# SPDX-FileCopyrightText: 2025 Contributors to the OpenSTEF project <openstef@lfenergy.org>
+#
+# SPDX-License-Identifier: MPL-2.0
+[build-system]
+build-backend = "hatchling.build"
+requires = [ "hatchling" ]
+
+[project]
+name = "openstef"
+version = "0.0.0"
+description = "Open Short Term Energy forecasting library"
+readme = "README.md"
+keywords = [ "energy", "forecasting", "machinelearning" ]
+license = "MPL-2.0"
+authors = [
+  { name = "Alliander N.V", email = "openstef@lfenergy.org" },
+]
+requires-python = ">=3.12,<4.0"
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+]
+dependencies = [
+  "openstef-core",
+  "openstef-models[xgb-cpu]",
+]
+optional-dependencies.all = [
+  "openstef-beam[all]",
+  "openstef-core",
+  "openstef-foundation-models[cpu]",
+  "openstef-meta",
+  "openstef-models[xgb-cpu]",
+]
+optional-dependencies.beam = [
+  "huggingface-hub>=0.35.3",
+  "openstef-beam",
+]
+optional-dependencies.foundation-models = [
+  "openstef-foundation-models[cpu]",
+]
+optional-dependencies.meta = [
+  "openstef-meta",
+]
+optional-dependencies.models = [
+  "openstef-models[xgb-cpu]",
+]
+urls.Documentation = "https://openstef.github.io/openstef/index.html"
+urls.Homepage = "https://lfenergy.org/projects/openstef/"
+urls.Issues = "https://github.com/OpenSTEF/openstef/issues"
+urls.Repository = "https://github.com/OpenSTEF/openstef"
+
+[dependency-groups]
+# Default environment: the complete CPU dev setup in one `uv sync`. For a GPU
+# environment run `uv sync --no-default-groups --group dev-gpu`.
+dev = [
+  { include-group = "build" },
+  { include-group = "deployment" },
+  { include-group = "docs" },
+  { include-group = "features-cpu" },
+  { include-group = "lint" },
+  { include-group = "notebooks" },
+  { include-group = "test" },
+  { include-group = "typecheck" },
+]
+test = [
+  "moto[s3,server]>=5.1.11",
+  "pytest>=8.4.1",
+  "pytest-cov>=6.2.1",
+  "pytest-xdist>=3.8",
+]
+docs = [ "openstef-docs" ]
+# Focused groups let a contributor (or a CI job) install just what a task needs;
+# the `dev` group above aggregates them into the full CPU environment, so everyday
+# setup is a single `uv sync`. The release/build job installs only `build` (the poe
+# runner), not the full dev stack.
+build = [ "poethepoet>=0.36", "pypi-attestations>=0.0.21", "sigstore>=3.6.5" ]
+deployment = [ "openstef-deployment-examples[airflow,celery,dagster]" ]
+dev-gpu = [
+  { include-group = "build" },
+  { include-group = "deployment" },
+  { include-group = "docs" },
+  { include-group = "features-gpu" },
+  { include-group = "lint" },
+  { include-group = "notebooks" },
+  { include-group = "test" },
+  { include-group = "typecheck" },
+]
+# Every workspace feature, CPU flavour. `features-gpu` is the opt-in counterpart;
+# the cpu/gpu runtimes conflict (declared on openstef-models and
+# openstef-foundation-models), so an environment installs one set, not both.
+features-cpu = [
+  "openstef-beam[all]",
+  "openstef-core[benchmark]",
+  "openstef-foundation-models[cpu]",
+  "openstef-meta",
+  "openstef-models[lgbm,tuning,xgb-cpu]",
+]
+features-gpu = [
+  "openstef-beam[all]",
+  "openstef-core[benchmark]",
+  "openstef-foundation-models[gpu]",
+  "openstef-meta",
+  "openstef-models[lgbm,tuning,xgb-gpu]",
+]
+lint = [
+  "licensecheck>=2025.1",
+  "pyproject-fmt>=2.24",
+  "reuse>=5.0.2",
+  "ruff>=0.12.8",
+]
+notebooks = [
+  "ipykernel>=6.29",
+  "jupytext>=1.19.1",
+  "nbconvert>=7.16",
+]
+typecheck = [
+  "microsoft-python-type-stubs",
+  "pandas-stubs>=2.3.0.250703",
+  "scipy-stubs>=1.16.2.4",
+  "ty>=0.0.48",
+]
+
+[tool.hatch]
+build.targets.wheel.bypass-selection = true
+
+[tool.uv]
+sources.microsoft-python-type-stubs = { git = "git+https://github.com/microsoft/python-type-stubs.git" }
+sources.openstef-beam = { workspace = true }
+sources.openstef-core = { workspace = true }
+sources.openstef-deployment-examples = { workspace = true }
+sources.openstef-docs = { workspace = true }
+sources.openstef-foundation-models = { workspace = true }
+sources.openstef-meta = { workspace = true }
+sources.openstef-models = { workspace = true }
+index = [ { name = "pypi", url = "https://pypi.org/simple", default = true } ]
+workspace.members = [
+  "docs",
+  "examples",
+  "examples/deployment",
+  "packages/openstef-beam",
+  "packages/openstef-core",
+  "packages/openstef-foundation-models",
+  "packages/openstef-meta",
+  "packages/openstef-models",
+]
+
+[tool.pyproject-fmt]
+column_width = 120
+indent = 2
+max_supported_python = "3.15"
+
+[tool.ty]
+src.include = [
+  "examples/**/*.py",
+  "packages/*/examples/**/*.py",
+  "packages/*/src/**/*.py",
+  "packages/*/tests/**/*.py",
+  "tools/**/*.py",
+]
+src.exclude = [
+  "**/.venv/**",                    # never type-check files inside a virtualenv (e.g. a member's local .venv)
+  "**/openstef_deployment_runs/**", # deployment example run artifacts
+  "examples/tutorials/**/*.py",
+]
+rules.all = "error"
+rules.possibly-missing-attribute = "ignore"  # ignored because large number of false positives, captured by ruff
+rules.possibly-missing-import = "ignore"  # ignored because large number of false positives, captured by ruff(I002)
+
+[tool.pytest]
+ini_options.testpaths = [ "examples/deployment/tests", "packages/*/tests", "tests" ]
+ini_options.python_files = [ "*_test.py", "test_*.py" ]
+ini_options.addopts = [
+  "--import-mode=importlib", # modern way to import tests
+  "--strict-markers",        # Force defining marks here (in a markers setting) to prevent typos
+]
+ini_options.markers = [
+  "integration: marks integration tests",
+  "slow: marks slow-running tests",
+]
+ini_options.filterwarnings = [
+  # Promote warnings to errors locally so regressions surface early; CI relaxes
+  # this via `poe tests --relaxed` (-W default). Add a scoped `ignore` below only
+  # when an external warning cannot be fixed in our code, with a justification.
+  "error",
+  # XGBoost upstream: `booster=gblinear` deprecation is emitted by the bundled C++
+  # library; we cannot suppress it at source and still need the linear booster.
+  "ignore:.*booster=gblinear.*is deprecated.*:UserWarning",
+  # onnxruntime is a native C++ library; during interpreter teardown its ctypes callback can raise an exception
+  # that Python cannot propagate. Scope the ignore to CPython's fixed ctypes-callback
+  # wording so genuine unraisable exceptions still fail.
+  "ignore:.*Exception ignored on calling ctypes callback function.*:pytest.PytestUnraisableExceptionWarning",
+  # joblib upstream: NumPy 2.5+ deprecated array.shape assignment. joblib 1.5.3 uses this
+  # in its unpickling code and cannot be fixed without upgrading joblib (not yet available).
+  "ignore:.*Setting the shape on a NumPy array has been deprecated.*:DeprecationWarning:joblib",
+  # Ignore fork() deprecation warning from multiprocessing on macOS
+  # This warning occurs when pytest (multi-threaded) spawns processes using fork()
+  # Using spawn instead breaks test infrastructure (fixtures not picklable)
+  "ignore:This process.*is multi-threaded.*use of fork.*may lead to deadlocks:DeprecationWarning",
+]
+ini_options.doctest_optionflags = "NORMALIZE_WHITESPACE"
+
+[tool.coverage]
+run.source = [
+  "packages/openstef-beam/src",
+  "packages/openstef-core/src",
+  "packages/openstef-foundation-models/src",
+  "packages/openstef-meta/src",
+  "packages/openstef-models/src",
+]
+run.omit = [
+  "examples/*",
+  "packages/*/src/examples/*",
+  "packages/*/src/tests/*",
+  "tests/*",
+]
+report.fail_under = 80
+report.omit = [ "packages/*/tests", "tests/*" ]
+report.skip_covered = true
+report.show_missing = true
+report.sort = "-Miss"
+
+[tool.poe]
+# Task definitions live in poe_tasks.toml (split out to keep this file lean).
+# The deployment example's poe_tasks.toml contributes the run-the-example deploy-*
+# tasks, co-located with the example so `uv run poe deploy-*` works from root.
+include = [ "poe_tasks.toml", "examples/deployment/poe_tasks.toml" ]
+
+[tool.licensecheck]
+# `requirements_paths` is set via CLI flags in poe_tasks.toml, not here: licensecheck's CLI
+# unconditionally overrides this config value back to ["pyproject.toml"] whenever
+# --requirements-paths isn't passed explicitly, silently ignoring this section.
+# Pycountry is LGPL-2.1 according to pypi.
+# MPL 2.0 lists explicitly that it is compatible with LGPL-2.1 and later, so we ignore it here (due to false positive).
+ignore_packages = [
+  "openstef-beam",
+  "openstef-core",
+  "openstef-foundation-models",
+  "openstef-meta",
+  "openstef-models",
+  "pycountry",
+]
+# Note: MPL 2.0 lists explicitly Apache License 2.0 as compatible, so we ignore it here (due to false positive).
+ignore_licenses = [ "apache software license", "apache license 2.0" ]
+extras = [ "all" ]
+# Skip our own editable workspace packages: licensecheck's dependency resolver
+# (depgather) cannot parse the `-e file://` entries `uv pip compile` emits for them
+# and would otherwise crash before any license is checked.
+skip_dependencies = [
+  "openstef-beam",
+  "openstef-core",
+  "openstef-deployment-examples",
+  "openstef-docs",
+  "openstef-examples",
+  "openstef-foundation-models",
+  "openstef-meta",
+  "openstef-models",
+]

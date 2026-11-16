@@ -1,0 +1,58 @@
+name: Test loadforecasting_framework
+
+on:
+  push:  
+    paths:
+      - 'src/**/*.py'
+  pull_request:  
+    paths:
+      - 'src/**/*.py'
+
+jobs:
+  test_the_framework:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /usr/local/lib/android
+        sudo apt-get clean
+        df -h
+
+    - name: Set up Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      env:
+        CONDA_PLUGINS_AUTO_ACCEPT_TOS: "yes"
+      with:
+        miniconda-version: "latest"
+        activate-environment: load_forecasting
+        environment-file: envs/env_linux.yml
+        auto-activate-base: false
+
+    - name: Show Conda Info 
+      shell: bash -l {0}
+      run: |
+        conda info
+        conda list
+
+    - name: Install the local package
+      shell: bash -l {0}
+      run: |
+        pip install --no-deps -e src/loadforecasting_models/
+        pip install --no-deps -e .
+
+    - name: Run the unittests   
+      shell: bash -l {0}
+      run: |
+        python tests/test_data_preprocessor.py
+        python tests/test_formatting_x.py
+        python tests/test_framework_components.py
+    
+    - name: Run training script    
+      shell: bash -l {0}
+      run: |
+        python src/loadforecasting_framework/model_trainer.py --mode ci        

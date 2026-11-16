@@ -1,0 +1,33 @@
+name: Test loadforecasting_models
+
+on:
+  push:
+    paths:
+     - 'src/loadforecasting_models/loadforecasting_models/*.py'
+     - 'tests/*.py'
+
+jobs:
+  test_loadforecasting_models:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.11, 3.13]
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install pytest
+        pip install ./src/loadforecasting_models
+
+    - name: Run tests
+      run: |
+        pytest tests/test_normalizer.py
+        pytest tests/test_forecasting_models.py

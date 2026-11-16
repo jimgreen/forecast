@@ -1,0 +1,678 @@
+# SPDX-FileCopyrightText: 2025 Contributors to the OpenSTEF project <openstef@lfenergy.org>
+#
+# SPDX-License-Identifier: MPL-2.0
+
+from collections.abc import Sequence
+
+import numpy as np
+import pytest
+
+from openstef_beam.metrics import (
+    ConfusionMatrix,
+    PrecisionRecall,
+    confusion_matrix,
+    fbeta,
+    mape,
+    pinball_loss,
+    precision_recall,
+    r2,
+    rcs,
+    relative_pinball_loss,
+    riqd,
+    rmae,
+)
+from openstef_core.types import Quantile
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "lower_quantile", "upper_quantile", "norm_value", "sample_weights", "expected"),
+    [
+        pytest.param([1, 2, 3], [1, 2, 3], 0.05, 0.95, None, None, 0.0, id="identical_arrays"),
+        pytest.param([1, 2, 3], [1, 2, 5.7], 0.05, 0.95, None, None, 0.5, id="rmae_exact_half"),
+        pytest.param([1, 1, 1], [1, 1, 1], 0.05, 0.95, None, None, np.nan, id="constant_array_nan"),
+        pytest.param([1, 2, 3], [2, 3, 4], 0.0, 1.0, None, None, 0.5, id="custom_quantiles"),
+        pytest.param(
+            [1, 2, 3],
+            [1, 2, 3],
+            0.05,
+            0.95,
+            None,
+            [1.0, 1.0, 1.0],
+            0.0,
+            id="identical_arrays_sample_weighted",
+        ),
+        # norm_value overrides the quantile range: MAE=1.0, norm_value=4 → rmae=0.25
+        pytest.param([1, 2, 3], [2, 3, 4], 0.0, 1.0, 4.0, None, 0.25, id="norm_value_overrides_range"),
+        # norm_value still works when y_true is constant (would give NaN without it): MAE=1.0, norm_value=1 → rmae=1.0
+        pytest.param([1, 1, 1], [2, 2, 2], 0.05, 0.95, 1.0, None, 1.0, id="norm_value_bypasses_constant_nan"),
+        # norm_value=0 must return NaN regardless of inputs
+        pytest.param([1, 2, 3], [2, 3, 4], 0.0, 1.0, 0.0, None, np.nan, id="norm_value_zero_returns_nan"),
+    ],
+)
+def test_rmae_various(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    lower_quantile: float,
+    upper_quantile: float,
+    norm_value: float | None,
+    sample_weights: Sequence[float] | None,
+    expected: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Prepare weights argument for rmae
+    weights_arg = np.array(sample_weights) if sample_weights is not None else None
+
+    # Act
+    result = rmae(
+        y_true_arr,
+        y_pred_arr,
+        lower_quantile=Quantile(lower_quantile),
+        upper_quantile=Quantile(upper_quantile),
+        norm_value=norm_value,
+        sample_weights=weights_arg,
+    )
+
+    # Assert
+    if np.isnan(expected):
+        assert np.isnan(result), f"Expected NaN but got {result}"
+    else:
+        assert abs(result - expected) < 1e-8, f"Expected {expected} but got {result}"
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "sample_weights", "expected", "tol"),
+    [
+        pytest.param(
+            [0, 0, 10],
+            [0, 10, 0],
+            None,
+            2 / 3,
+            1e-8,
+            id="unweighted_two_thirds",
+        ),
+        pytest.param(
+            [0, 0, 10],
+            [0, 10, 0],
+            [1.0, 1.0, 1.0],
+            2 / 3,
+            1e-8,
+            id="all_ones_equals_unweighted",
+        ),
+        pytest.param(
+            [0, 0, 10],
+            [0, 10, 0],
+            [1.0, 0.0, 0.0],
+            0.0,
+            1e-8,
+            id="only_first_sample_weighted_zero_rmae",
+        ),
+        pytest.param(
+            [0, 0, 10],
+            [0, 10, 0],
+            [0.0, 0.0, 1.0],
+            1.0,
+            1e-8,
+            id="only_last_sample_weighted_full_rmae",
+        ),
+    ],
+)
+def test_rmae_sample_weights_behavior(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    sample_weights: Sequence[float] | None,
+    expected: float,
+    tol: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    weights_arg = np.array(sample_weights) if sample_weights is not None else None
+
+    # Act
+    # use full range quantiles so range = max - min = 10 in these vectors
+    result = rmae(
+        y_true_arr, y_pred_arr, lower_quantile=Quantile(0.0), upper_quantile=Quantile(1.0), sample_weights=weights_arg
+    )
+
+    # Assert
+    # Check numerical equality to the expected concrete value
+    assert abs(result - expected) < tol, f"Expected {expected} but got {result} for weights={sample_weights}"
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred"),
+    [
+        pytest.param([1, 2, np.nan], [1, np.nan, 2], id="both_contain_nan"),
+        pytest.param([1, 2, 3], [1, 3, np.nan], id="y_pred_contains_nan"),
+        pytest.param([1, 3, np.nan], [1, 2, 3], id="y_true_contains_nan"),
+    ],
+)
+def test_rmae_allow_nan(y_true: Sequence[float], y_pred: Sequence[float]) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act
+    result_allow_nan = rmae(y_true_arr, y_pred_arr, norm_value=1.0, allow_nan=True)
+    result_disallow_nan = rmae(y_true_arr, y_pred_arr, norm_value=1.0, allow_nan=False)
+
+    # Assert
+    assert not np.isnan(result_allow_nan), "Expected a valid number when allow_nan=True but got NaN"
+    assert np.isnan(result_disallow_nan), f"Expected NaN when allow_nan=False but got {result_disallow_nan}"
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "norm_value"),
+    [
+        pytest.param([1, 2, 3], [2, 3, 4], 0.0, id="norm_value_zero"),
+        pytest.param([], [1, 2, 3], 1.0, id="empty_y_true"),
+        pytest.param([1, 2, 3], [], 1.0, id="empty_y_pred"),
+        pytest.param([], [], 1.0, id="both_empty"),
+    ],
+)
+def test_rmae_returns_nan_when_inputs_empty(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    norm_value: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act
+    result = rmae(y_true_arr, y_pred_arr, norm_value=norm_value)
+
+    # Assert
+    assert np.isnan(result)
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "expected", "tol"),
+    [
+        pytest.param([1, 2, 3], [1, 2, 3], 0.0, 1e-8, id="identical_arrays"),
+        pytest.param([2, 4, 10], [3, 6, 15], 0.5, 1e-8, id="exact_50_percent"),
+        pytest.param([10, 20, 30], [5, 10, 15], 0.5, 1e-8, id="exact_minus_50_percent"),
+    ],
+)
+def test_mape_various(y_true: Sequence[float], y_pred: Sequence[float], expected: float, tol: float) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act
+    result = mape(y_true_arr, y_pred_arr)
+
+    # Assert
+    assert abs(result - expected) < tol, f"Expected {expected} but got {result}"
+
+
+def test_mape_returns_nan_when_inputs_empty() -> None:
+    # Arrange
+    y_true_arr = np.array([])
+    y_pred_arr = np.array([])
+
+    # Act
+    result = mape(y_true_arr, y_pred_arr)
+
+    # Assert
+    assert np.isnan(result)
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred"),
+    [
+        pytest.param([0, 2, 4], [1, 2, 4], id="first_value_zero"),
+        pytest.param([0, 0, 0], [1, 1, 1], id="all_zeros"),
+    ],
+)
+def test_mape_division_by_zero(y_true: Sequence[float], y_pred: Sequence[float]) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act & Assert
+    with pytest.warns(RuntimeWarning):
+        result = mape(y_true_arr, y_pred_arr)
+
+    assert np.isnan(result) or np.isinf(result)
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "expected_result"),
+    [
+        pytest.param(
+            [-1, 5, 2],
+            [-1, 5, 2],
+            {
+                "tp": [True, True, False],
+                "tn": [False, False, True],
+                "fp": [False, False, False],
+                "fn": [False, False, False],
+            },
+            id="perfect_match",
+        ),
+        pytest.param(
+            [0, 5, 2],
+            [5, 0, 2],
+            {
+                "tp": [False, False, False],
+                "tn": [False, False, True],
+                "fp": [True, False, False],
+                "fn": [False, True, False],
+            },
+            id="swapped_extremes",
+        ),
+    ],
+)
+def test_confusion_matrix_simple(
+    y_true: Sequence[float], y_pred: Sequence[float], expected_result: dict[str, Sequence[bool]]
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act
+    cm = confusion_matrix(y_true_arr, y_pred_arr, limit_pos=3, limit_neg=-1)
+
+    # Assert
+    assert np.array_equal(cm.true_positives, np.array(expected_result["tp"]))
+    assert np.array_equal(cm.true_negatives, np.array(expected_result["tn"]))
+    assert np.array_equal(cm.false_positives, np.array(expected_result["fp"]))
+    assert np.array_equal(cm.false_negatives, np.array(expected_result["fn"]))
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "expected_effective"),
+    [
+        pytest.param([2, 4, 0], [2, 5, -1], [False, True, True], id="effective_prediction"),
+        pytest.param([2, 4, 0], [2, 3, -1], [False, False, True], id="ineffective_prediction"),
+    ],
+)
+def test_confusion_matrix_effective(
+    y_true: Sequence[float], y_pred: Sequence[float], expected_effective: Sequence[bool]
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+
+    # Act
+    cm = confusion_matrix(y_true_arr, y_pred_arr, limit_pos=3, limit_neg=1)
+
+    # Assert
+    assert np.array_equal(cm.effective_true_positives, np.array(expected_effective))
+
+
+@pytest.mark.parametrize(
+    ("cm", "effective", "expected"),
+    [
+        pytest.param(
+            ConfusionMatrix(
+                true_positives=np.array([True, True]),
+                true_negatives=np.array([True, True]),
+                false_positives=np.array([False, False]),
+                false_negatives=np.array([False, False]),
+                effective_true_positives=np.array([True, True]),
+                ineffective_true_positives=np.array([False, False]),
+            ),
+            False,
+            {"precision": 1.0, "recall": 1.0},
+            id="perfect_prediction",
+        ),
+        pytest.param(
+            ConfusionMatrix(
+                true_positives=np.array([True, False]),
+                true_negatives=np.array([False, True]),
+                false_positives=np.array([True, False]),
+                false_negatives=np.array([False, False]),
+                effective_true_positives=np.array([True, False]),
+                ineffective_true_positives=np.array([False, False]),
+            ),
+            False,
+            {"precision": 0.5, "recall": 1.0},
+            id="half_precision",
+        ),
+    ],
+)
+def test_precision_recall_simple(cm: ConfusionMatrix, effective: bool, expected: dict[str, float]) -> None:
+    # Act
+    pr = precision_recall(cm, effective=effective)
+
+    # Assert
+    assert pr.precision == expected["precision"], (
+        f"Precision mismatch: got {pr.precision}, expected {expected['precision']}"
+    )
+    assert pr.recall == expected["recall"], f"Recall mismatch: got {pr.recall}, expected {expected['recall']}"
+
+
+@pytest.mark.parametrize(
+    ("precision", "recall", "beta", "expected"),
+    [
+        pytest.param(1.0, 1.0, 2.0, 1.0, id="perfect_scores"),
+        pytest.param(0.0, 0.0, 2.0, 0.0, id="zero_scores"),
+        pytest.param(0.5, 1.0, 1.0, 2 / 3, id="f1"),
+        pytest.param(0.5, 1.0, 2.0, 5 / 6, id="f2"),
+    ],
+)
+def test_fbeta_simple(precision: float, recall: float, beta: float, expected: float) -> None:
+    # Arrange
+    pr = PrecisionRecall(precision=precision, recall=recall)
+
+    # Act
+    score = fbeta(pr, beta=beta)
+
+    # Assert
+    assert abs(score - expected) < 1e-8, f"Expected {expected} but got {score}"
+
+
+@pytest.mark.parametrize(
+    (
+        "y_true",
+        "y_pred_lower_q",
+        "y_pred_upper_q",
+        "measurement_range_lower_q",
+        "measurement_range_upper_q",
+        "expected",
+        "tol",
+    ),
+    [
+        pytest.param(
+            [100, 120, 110, 130, 105],
+            [90, 100, 105, 95, 85],
+            [110, 125, 140, 135, 90],
+            0.05,
+            0.95,
+            0.9259,
+            1e-3,
+            id="basic_energy_data",
+        ),
+        pytest.param(
+            [1, 2, 3, 4, 5],
+            [0.5, 1.5, 2.5, 3.5, 4.5],
+            [1.5, 2.5, 3.5, 4.5, 5.5],
+            0.0,
+            1.0,
+            0.25,
+            1e-3,
+            id="uniform_iqd_spacing",
+        ),
+        pytest.param(
+            [10, 10, 10],
+            [5, 5, 5],
+            [15, 15, 15],
+            0.05,
+            0.95,
+            np.nan,
+            0,
+            id="constant_true_values_nan",
+        ),
+        pytest.param(
+            [1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5],
+            [1, 2, 3, 4, 5],
+            0.0,
+            1.0,
+            0.0,
+            1e-8,
+            id="zero_iqd_custom_quantiles",
+        ),
+    ],
+)
+def test_riqd_various(
+    y_true: Sequence[float],
+    y_pred_lower_q: Sequence[float],
+    y_pred_upper_q: Sequence[float],
+    measurement_range_lower_q: float,
+    measurement_range_upper_q: float,
+    expected: float,
+    tol: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_lower_q_arr = np.array(y_pred_lower_q)
+    y_pred_upper_q_arr = np.array(y_pred_upper_q)
+
+    # Act
+    result = riqd(
+        y_true_arr,
+        y_pred_lower_q_arr,
+        y_pred_upper_q_arr,
+        measurement_range_lower_q=Quantile(measurement_range_lower_q),
+        measurement_range_upper_q=Quantile(measurement_range_upper_q),
+    )
+
+    # Assert
+    if np.isnan(expected):
+        assert np.isnan(result), f"Expected NaN but got {result}"
+    else:
+        assert abs(result - expected) < tol, f"Expected {expected} but got {result}"
+
+
+def test_riqd_returns_nan_when_inputs_empty() -> None:
+    # Arrange
+    empty_arr = np.array([])
+
+    # Act
+    result = riqd(empty_arr, empty_arr, empty_arr)
+
+    # Assert
+    assert np.isnan(result)
+
+
+def test_rcs() -> None:
+    """Test the regression coverage score with a sample prediction interval."""
+    y_true = np.array([100.0, 120.0, 110.0, 130.0])
+    y_pred_lower_q = np.array([90.0, 115.0, 105.0, 125.0])
+    y_pred_upper_q = np.array([110.0, 125.0, 115.0, 128.0])
+
+    result = rcs(
+        y_true=y_true,
+        y_pred_lower_q=y_pred_lower_q,
+        y_pred_upper_q=y_pred_upper_q,
+    )
+
+    assert isinstance(result, float)
+    assert result == 0.75
+
+
+@pytest.mark.parametrize(
+    (
+        "y_true",
+        "y_pred",
+        "quantile",
+        "measurement_range_lower_q",
+        "measurement_range_upper_q",
+        "sample_weights",
+        "expected",
+        "tol",
+    ),
+    [
+        pytest.param(
+            [100, 120, 110, 130, 105],
+            [100, 120, 110, 130, 105],
+            0.5,
+            0.05,
+            0.95,
+            None,
+            0.0,
+            1e-8,
+            id="perfect_predictions",
+        ),
+        pytest.param(
+            [100, 110, 120],
+            [90, 100, 110],
+            0.1,
+            0.0,
+            1.0,
+            None,
+            0.05,
+            1e-3,
+            id="all_under_predictions_q01",
+        ),
+        pytest.param(
+            [100, 110, 120],
+            [110, 120, 130],
+            0.9,
+            0.0,
+            1.0,
+            None,
+            0.05,
+            1e-3,
+            id="all_over_predictions_q09",
+        ),
+        pytest.param(
+            [100, 100, 100],
+            [95, 105, 100],
+            0.5,
+            0.05,
+            0.95,
+            None,
+            np.nan,
+            0,
+            id="constant_true_values_nan",
+        ),
+        pytest.param(
+            [1, 2, 3, 4, 5],
+            [0.5, 1.5, 2.5, 4.5, 4.5],
+            0.5,
+            0.0,
+            1.0,
+            None,
+            0.0625,
+            1e-3,
+            id="median_predictions_under_over",
+        ),
+        pytest.param(
+            [10, 20, 30],
+            [8, 22, 26],
+            0.2,
+            0.0,
+            1.0,
+            None,
+            0.0467,
+            1e-3,
+            id="quantile_02_under_over",
+        ),
+        pytest.param(
+            [100, 200, 150],
+            [90, 210, 160],
+            0.3,
+            0.1,
+            0.9,
+            [1.0, 2.0, 1.0],
+            0.075,
+            1e-3,
+            id="mixed_errors_with_weights",
+        ),
+    ],
+)
+def test_relative_pinball_loss_various(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    quantile: float,
+    measurement_range_lower_q: float,
+    measurement_range_upper_q: float,
+    sample_weights: Sequence[float] | None,
+    expected: float,
+    tol: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    weights_arg = np.array(sample_weights) if sample_weights is not None else None
+
+    # Act
+    result = relative_pinball_loss(
+        y_true_arr,
+        y_pred_arr,
+        quantile=Quantile(quantile),
+        measurement_range_lower_q=Quantile(measurement_range_lower_q),
+        measurement_range_upper_q=Quantile(measurement_range_upper_q),
+        sample_weights=weights_arg,
+    )
+
+    # Assert
+    if np.isnan(expected):
+        assert np.isnan(result), f"Expected NaN but got {result}"
+    else:
+        assert abs(result - expected) < tol, f"Expected {expected} but got {result}"
+
+
+def test_relative_pinball_loss_returns_nan_when_inputs_empty() -> None:
+    # Arrange
+    y_true_arr = np.array([])
+    y_pred_arr = np.array([])
+
+    # Act
+    result = relative_pinball_loss(y_true_arr, y_pred_arr, quantile=Quantile(0.5))
+
+    # Assert
+    assert np.isnan(result)
+
+
+@pytest.mark.parametrize(
+    ("y_true", "y_pred", "quantile", "sample_weights", "expected"),
+    [
+        # Perfect prediction yields zero loss.
+        pytest.param([10, 20, 30], [10, 20, 30], 0.5, None, 0.0, id="perfect_prediction"),
+        # Low quantile: under-predictions weighted by q, over-prediction by (1 - q). mean([0.5, 0.4, 0.9]) = 0.6
+        pytest.param([100, 120, 110], [95, 116, 111], 0.1, None, 0.6, id="low_quantile"),
+        # High quantile mixing under- and over-predictions. mean([0.2, 1.8, 0.3]) = 2.3/3
+        pytest.param([10, 20, 30], [12, 18, 33], 0.9, None, 2.3 / 3, id="high_quantile"),
+        # Same as high_quantile but sample weighted: (0.2 * 1 + 1.8 * 2 + 0.3 * 1) / 4 = 1.025
+        pytest.param([10, 20, 30], [12, 18, 33], 0.9, [1.0, 2.0, 1.0], 1.025, id="high_quantile_sample_weighted"),
+    ],
+)
+def test_pinball_loss_various(
+    y_true: Sequence[float],
+    y_pred: Sequence[float],
+    quantile: float,
+    sample_weights: Sequence[float] | None,
+    expected: float,
+) -> None:
+    # Arrange
+    y_true_arr = np.array(y_true)
+    y_pred_arr = np.array(y_pred)
+    weights_arg = np.array(sample_weights) if sample_weights is not None else None
+
+    # Act
+    result = pinball_loss(y_true_arr, y_pred_arr, quantile=Quantile(quantile), sample_weights=weights_arg)
+
+    # Assert
+    assert abs(result - expected) < 1e-8, f"Expected {expected} but got {result}"
+
+
+def test_r2_perfect_and_constant_predictor():
+    """R² is 1.0 for a perfect fit and 0.0 for a constant mean predictor."""
+    y_true = np.array([1.0, 2.0, 3.0, 4.0])
+
+    assert r2(y_true, y_true) == pytest.approx(1.0)
+    assert r2(y_true, np.full_like(y_true, y_true.mean())) == pytest.approx(0.0)
+
+
+def test_r2_matches_known_values():
+    """R² matches hand-computed values, including a sample-weighted case."""
+    # 1 - 1.5 / 29.1875
+    assert r2(np.array([3.0, -0.5, 2.0, 7.0]), np.array([2.5, 0.0, 2.0, 8.0])) == pytest.approx(0.948608, abs=1e-5)
+    # Weighted: weighted mean 2.25, residual sum 2.0, total sum 2.75 -> 1 - 2 / 2.75
+    weighted = r2(
+        np.array([1.0, 2.0, 3.0]),
+        np.array([1.0, 2.0, 4.0]),
+        sample_weights=np.array([1.0, 1.0, 2.0]),
+    )
+    assert weighted == pytest.approx(0.272727, abs=1e-5)
+
+
+def test_r2_undefined_for_fewer_than_two_samples():
+    """Fewer than two samples returns NaN (R² undefined, matches scikit-learn)."""
+    assert np.isnan(r2(np.array([]), np.array([])))
+    assert np.isnan(r2(np.array([5.0]), np.array([5.0])))
+
+
+def test_r2_constant_target():
+    y_true = np.array([5.0, 5.0, 5.0])
+
+    assert r2(y_true, y_true) == pytest.approx(1.0)
+    assert r2(y_true, np.array([5.0, 5.0, 6.0])) == pytest.approx(0.0)

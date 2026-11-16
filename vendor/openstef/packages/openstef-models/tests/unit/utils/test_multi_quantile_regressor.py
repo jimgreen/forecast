@@ -1,0 +1,146 @@
+# SPDX-FileCopyrightText: 2025 Contributors to the OpenSTEF project <short.term.energy.forecasts@alliander.com>
+#
+# SPDX-License-Identifier: MPL-2.0
+from typing import cast
+
+import pandas as pd
+import pytest
+from lightgbm import LGBMRegressor
+from numpy.random import default_rng
+from pydantic import BaseModel
+from sklearn.base import BaseEstimator
+from sklearn.linear_model import QuantileRegressor
+from xgboost import XGBRegressor
+
+from openstef_core.types import Quantile
+from openstef_models.utils.multi_quantile_regressor import MultiQuantileRegressor, ParamType
+
+ParamDict = dict[str, ParamType]
+BaseLearner = BaseEstimator
+
+
+class BaseLearnerConfig(BaseModel):
+    base_learner: type[BaseLearner]
+    quantile_param: str
+    hyperparams: ParamDict
+
+
+@pytest.fixture
+def dataset() -> tuple[pd.DataFrame, pd.Series]:
+    n_samples = 100
+    n_features = 5
+    rng = default_rng()
+    X = pd.DataFrame(rng.random((n_samples, n_features)))
+    y = pd.Series(rng.random(n_samples))
+    return X, y
+
+
+@pytest.fixture(params=["sklearn_quantile", "lgbm", "xgboost"])
+def baselearner_config(request: pytest.FixtureRequest) -> BaseLearnerConfig:
+    model = cast(str, request.param)
+    if model == "sklearn_quantile":
+        return BaseLearnerConfig(
+            base_learner=QuantileRegressor,
+            quantile_param="quantile",
+            hyperparams={"alpha": 0.1, "solver": "highs", "fit_intercept": True},
+        )
+    if model == "lgbm":
+        return BaseLearnerConfig(
+            base_learner=LGBMRegressor,
+            quantile_param="alpha",
+            hyperparams={
+                "objective": "quantile",
+                "n_estimators": 10,
+                "learning_rate": 0.1,
+                "max_depth": -1,
+            },
+        )
+    return BaseLearnerConfig(
+        base_learner=XGBRegressor,
+        quantile_param="quantile_alpha",
+        hyperparams={
+            "objective": "reg:quantileerror",
+            "n_estimators": 10,
+            "learning_rate": 0.1,
+            "max_depth": 3,
+        },
+    )
+
+
+def test_init_sets_quantiles_and_models(baselearner_config: BaseLearnerConfig):
+    # Arrange
+    quantiles = [Quantile(0.1), Quantile(0.5), Quantile(0.9)]
+
+    # Act
+    model = MultiQuantileRegressor(
+        base_learner=baselearner_config.base_learner,
+        quantile_param=baselearner_config.quantile_param,
+        quantiles=quantiles,
+        hyperparams=baselearner_config.hyperparams,
+    )
+
+    # Assert
+    assert model.quantiles == quantiles
+    assert len(model._models) == len(quantiles)
+
+
+def test_fit_and_predict_shape(dataset: tuple[pd.DataFrame, pd.Series], baselearner_config: BaseLearnerConfig):
+    # Arrange
+    quantiles = [Quantile(0.1), Quantile(0.5), Quantile(0.9)]
+    X, y = dataset[0], dataset[1]
+    model = MultiQuantileRegressor(
+        base_learner=baselearner_config.base_learner,
+        quantile_param=baselearner_config.quantile_param,
+        quantiles=quantiles,
+        hyperparams=baselearner_config.hyperparams,
+    )
+
+    # Act
+    model.fit(X, y)
+    preds = model.predict(X)
+
+    # Assert
+    assert preds.shape == (X.shape[0], len(quantiles))
+
+
+def test_is_fitted_true_after_fit(dataset: tuple[pd.DataFrame, pd.Series], baselearner_config: BaseLearnerConfig):
+    # Arrange
+    quantiles = [Quantile(0.1), Quantile(0.5), Quantile(0.9)]
+    X, y = dataset[0], dataset[1]
+    model = MultiQuantileRegressor(
+        base_learner=baselearner_config.base_learner,
+        quantile_param=baselearner_config.quantile_param,
+        quantiles=quantiles,
+        hyperparams=baselearner_config.hyperparams,
+    )
+
+    # Act
+    model.fit(X, y)
+
+    # Assert
+    assert model.is_fitted
+
+
+def test_fit_forwards_eval_set_for_early_stopping_lgbm(dataset: tuple[pd.DataFrame, pd.Series]):
+    # Arrange
+    quantiles = [Quantile(0.1), Quantile(0.5), Quantile(0.9)]
+    early_stopping_rounds = 3
+    X, y = dataset
+    y = y.to_numpy()
+    X_train, y_train = X.iloc[:80], y[:80]  # noqa: N806
+    X_val, y_val = X.iloc[80:], y[80:]  # noqa: N806
+    model = MultiQuantileRegressor(
+        base_learner=LGBMRegressor,
+        quantile_param="alpha",
+        quantiles=quantiles,
+        hyperparams={"objective": "quantile", "n_estimators": 10, "early_stopping_rounds": early_stopping_rounds},
+    )
+
+    # Act
+    model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_val, y_val)])
+
+    # Assert
+    for estimator in model.models:
+        assert isinstance(estimator, LGBMRegressor)
+        assert estimator.get_params()["early_stopping_rounds"] == early_stopping_rounds
+        assert estimator.evals_result_

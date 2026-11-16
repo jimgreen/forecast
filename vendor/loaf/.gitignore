@@ -1,0 +1,18 @@
+# OSX Files
+.DS_Store
+
+# Claude Files
+.claude
+copilot-instructions.md
+
+# Python files
+*.pyc
+
+# ERA5 Data 
+*.nc
+
+IEM Data
+*.parquet
+
+#Run Output
+/runs
