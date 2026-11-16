@@ -8,6 +8,7 @@ stable JSON-shaped dictionaries without knowing the SQL schema.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from typing import Iterable, Iterator, Mapping, Sequence
 
 SCHEMA_VERSION = 2
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+DEFAULT_DB_PATH = Path(os.environ.get("FORECAST_DB_PATH", r"D:\codex\sqldb\realtime\forecast\forecast.db"))
 
 
 def utc_now() -> str:
@@ -234,8 +236,8 @@ CREATE INDEX IF NOT EXISTS idx_eval_run ON forecast_evaluations(run_id, evaluate
 class ForecastDB:
     """Repository for the forecast SQLite database."""
 
-    def __init__(self, path: str | Path = "data/forecast.db") -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else DEFAULT_DB_PATH
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

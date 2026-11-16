@@ -78,14 +78,14 @@ python scripts\serve_web.py --port 18765
 
 ## SQLite 数据库
 
-服务使用 `data/forecast.db` 作为界面展示和后台计算的共享数据存储。首次使用时运行：
+服务使用 `D:\codex\sqldb\realtime\forecast\forecast.db` 作为界面展示和后台计算的共享数据存储。首次使用时运行：
 
 ```powershell
 cd D:\codex\forecast
 python scripts\init_forecast_db.py
 ```
 
-初始化会创建 schema、默认预测点、Open-Meteo/NOAA NWP 数据源配置，并把示例周前预测写入数据库。开发环境如需重建，可使用 `python scripts\init_forecast_db.py --reset`。数据库包含预测点、预测任务运行记录、气象历史/实时观测、NWP/融合天气预测、新能源与负荷测量、光伏/风电/负荷预测结果、NWP 数据源、任务配置、模型注册、训练运行、滚动更新、自动调度和结果评估表。服务 API `/api/health`、`/api/points`、`/api/forecast`、`/api/runs`、`/api/weather-observations` 和 `/api/energy-measurements` 均读写这套 SQLite 数据。生产环境应同时备份 `forecast.db`、`forecast.db-wal` 和 `forecast.db-shm` 文件。
+初始化会创建 schema、默认预测点、Open-Meteo/NOAA NWP 数据源配置，并把示例周前预测写入数据库。开发环境如需重建，可使用 `python scripts\init_forecast_db.py --reset`。数据库包含预测点、预测任务运行记录、气象历史/实时观测、NWP/融合天气预测、新能源与负荷测量、光伏/风电/负荷预测结果、NWP 数据源、任务配置、模型注册、训练运行、滚动更新、自动调度和结果评估表。服务 API `/api/health`、`/api/points`、`/api/forecast`、`/api/runs`、`/api/weather-observations` 和 `/api/energy-measurements` 均读写这套 SQLite 数据。生产环境应同时备份 `forecast.db`、`forecast.db-wal` 和 `forecast.db-shm` 文件。可通过环境变量 `FORECAST_DB_PATH` 覆盖默认路径。
 
 模型和任务闭环还包括：
 

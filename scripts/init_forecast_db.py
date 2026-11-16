@@ -15,12 +15,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from forecast_pipeline.storage import ForecastDB, seed_from_demo_csv
+from forecast_pipeline.storage import DEFAULT_DB_PATH, ForecastDB, seed_from_demo_csv
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Initialize the forecast SQLite database")
-    parser.add_argument("--db", default=str(ROOT / "data" / "forecast.db"))
+    parser.add_argument("--db", default=str(DEFAULT_DB_PATH))
     parser.add_argument("--reset", action="store_true", help="remove the named database before initialization")
     args = parser.parse_args()
     db_path = Path(args.db)

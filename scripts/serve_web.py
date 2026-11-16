@@ -32,7 +32,7 @@ from forecast_pipeline.pipeline import IntegratedForecastPipeline  # noqa: E402
 from forecast_pipeline.schema import make_future_index  # noqa: E402
 from forecast_pipeline.storage import ForecastDB, seed_from_demo_csv  # noqa: E402
 
-DB = ForecastDB(ROOT / "data" / "forecast.db")
+DB = ForecastDB()
 DB.initialize()
 DB.seed_defaults()
 seed_from_demo_csv(DB, DATA)
