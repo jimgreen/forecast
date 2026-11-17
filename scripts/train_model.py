@@ -22,7 +22,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train or roll the local forecast model")
     parser.add_argument("--point", default=None)
     parser.add_argument("--kind", choices=("weather", "energy", "combined"), default="combined")
-    parser.add_argument("--horizon", choices=("ultrashort", "day_ahead", "week_ahead"), default="day_ahead")
+    parser.add_argument("--horizon", choices=("hour_ahead", "ultrashort", "day_ahead", "week_ahead"), default="day_ahead")
     parser.add_argument("--mode", choices=("offline", "rolling"), default="offline")
     parser.add_argument("--window-size", type=int, default=None)
     args = parser.parse_args()

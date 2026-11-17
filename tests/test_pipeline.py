@@ -22,3 +22,19 @@ def test_all_horizons_have_15_minute_grid():
     assert len(result) == 672
     assert (result.index.to_series().diff().dropna() == pd.Timedelta(minutes=15)).all()
     assert result[["pv_power_kw", "wind_power_kw", "load_kw"]].ge(0).all().all()
+
+
+def test_hour_ahead_weather_targets_keep_weather_columns():
+    data = make_demo_data()
+    pipeline = IntegratedForecastPipeline().fit(
+        data, targets=("wind_speed_mps", "temperature_c", "solar_radiation_wm2")
+    )
+    last = data.timestamp.iloc[-1] + pd.Timedelta(days=2)
+    index = pd.date_range(last + pd.Timedelta(minutes=15), periods=4, freq="15min")
+    future = data.set_index("timestamp")[
+        ["wind_speed_mps", "temperature_c", "solar_radiation_wm2"]
+    ].reindex(index, method="ffill")
+    result = pipeline.predict("hour_ahead", future)
+    assert len(result) == 4
+    assert result.index.equals(index.tz_convert("UTC"))
+    assert set(result.columns) == {"wind_speed_mps", "temperature_c", "solar_radiation_wm2"}

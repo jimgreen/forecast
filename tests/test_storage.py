@@ -51,3 +51,28 @@ def test_model_schedule_and_evaluation_roundtrip(tmp_path):
     assert db.list_training_runs()[0]["status"] == "success"
     assert db.list_schedules()[0]["schedule_id"] == "SCH-1"
     assert db.list_evaluations()[0]["status"] == "pending"
+
+
+def test_hour_weather_and_nwp_cache_roundtrip(tmp_path):
+    db = ForecastDB(tmp_path / "forecast.db")
+    db.initialize()
+    db.seed_defaults()
+    db.create_run("HOUR-1", "P001", "weather", "hour_ahead")
+    rows = [{
+        "source_id": "openmeteo-icon",
+        "point_id": "P001",
+        "issued_at_utc": "2026-01-01T00:00:00Z",
+        "target_time_utc": "2026-01-01T01:00:00Z",
+        "horizon": "hour_ahead",
+        "wind_speed_mps": 4.0,
+        "temperature_c": 15.0,
+        "solar_radiation_wm2": 120.0,
+    }]
+    assert db.save_nwp_forecasts(rows) == 1
+    assert db.list_nwp_forecasts("P001", "hour_ahead")[0]["wind_speed_mps"] == 4.0
+    assert db.save_forecast_rows("HOUR-1", "P001", "hour_ahead", [{
+        "timestamp": "2026-01-01T01:00:00Z",
+        "wind_speed_mps": 4.0,
+        "temperature_c": 15.0,
+        "solar_radiation_wm2": 120.0,
+    }], kind="weather") == 1

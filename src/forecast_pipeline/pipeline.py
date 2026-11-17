@@ -10,7 +10,7 @@ import pandas as pd
 from .fusion import fuse_weather
 from .model import Ridge15MinForecaster
 from .providers import OpenMeteoProvider
-from .schema import TARGET_COLUMNS, WEATHER_COLUMNS, canonicalize_columns, ensure_utc_index, make_future_index, require_columns, to_15min
+from .schema import HORIZON_STEPS, TARGET_COLUMNS, WEATHER_COLUMNS, canonicalize_columns, ensure_utc_index, make_future_index, require_columns, to_15min
 
 
 @dataclass
@@ -33,11 +33,19 @@ class IntegratedForecastPipeline:
     def weather_for(self, horizon: str | int, future_weather: pd.DataFrame | None = None) -> pd.DataFrame:
         if self.history is None:
             raise RuntimeError("fit the pipeline before requesting a forecast")
-        index = make_future_index(self.history.index[-1], horizon)
         if future_weather is None:
+            index = make_future_index(self.history.index[-1], horizon)
             if self.provider is None:
                 raise ValueError("future_weather or a weather provider is required")
             future_weather = self.provider.forecast(start=index[0], end=index[-1])
+        else:
+            candidate = future_weather["timestamp"] if "timestamp" in future_weather.columns else future_weather.index
+            index = pd.DatetimeIndex(pd.to_datetime(candidate, errors="raise", utc=True))
+            index = index[~index.duplicated()].sort_values()
+            if isinstance(horizon, str) and horizon in HORIZON_STEPS:
+                index = index[: HORIZON_STEPS[horizon]]
+            elif not isinstance(horizon, str):
+                index = index[: max(1, int(horizon))]
         local_weather = self.history[list(WEATHER_COLUMNS)]
         weather = fuse_weather(future_weather, local=local_weather, timezone=self.timezone)
         weather = weather[list(WEATHER_COLUMNS)].reindex(index).interpolate(method="time").ffill().bfill()
@@ -48,4 +56,5 @@ class IntegratedForecastPipeline:
             raise RuntimeError("fit the pipeline before predicting")
         weather = self.weather_for(horizon, future_weather=future_weather)
         predictions = self.model.predict(self.history, weather)
-        return predictions.join(weather[list(WEATHER_COLUMNS)])
+        weather_only = weather[[column for column in WEATHER_COLUMNS if column not in predictions.columns]]
+        return predictions.join(weather_only)

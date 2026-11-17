@@ -8,6 +8,12 @@ import pandas as pd
 
 WEATHER_COLUMNS = ("wind_speed_mps", "temperature_c", "solar_radiation_wm2")
 TARGET_COLUMNS = ("pv_power_kw", "wind_power_kw", "load_kw")
+HORIZON_STEPS = {
+    "hour_ahead": 4,
+    "ultrashort": 16,
+    "day_ahead": 96,
+    "week_ahead": 7 * 96,
+}
 
 ALIASES = {
     "wind_speed": "wind_speed_mps",
@@ -74,11 +80,7 @@ def to_15min(
 
 def make_future_index(last_timestamp: pd.Timestamp, horizon: str | int) -> pd.DatetimeIndex:
     """Build a 15-minute UTC horizon from a label or number of steps."""
-    steps = {
-        "ultrashort": 16,  # four hours
-        "day_ahead": 96,
-        "week_ahead": 7 * 96,
-    }.get(str(horizon), None)
+    steps = HORIZON_STEPS.get(str(horizon), None)
     if steps is None:
         steps = int(horizon)
     return pd.date_range(

@@ -29,7 +29,9 @@ MODEL_DIR = ROOT / "data" / "models"
 sys.path.insert(0, str(ROOT / "src"))
 
 from forecast_pipeline.pipeline import IntegratedForecastPipeline  # noqa: E402
-from forecast_pipeline.schema import make_future_index  # noqa: E402
+from forecast_pipeline.fusion import fuse_weather  # noqa: E402
+from forecast_pipeline.providers import OpenMeteoProvider  # noqa: E402
+from forecast_pipeline.schema import WEATHER_COLUMNS, make_future_index  # noqa: E402
 from forecast_pipeline.storage import ForecastDB, seed_from_demo_csv  # noqa: E402
 
 DB = ForecastDB()
@@ -37,7 +39,7 @@ DB.initialize()
 DB.seed_defaults()
 seed_from_demo_csv(DB, DATA)
 
-HORIZONS = {"ultrashort": 16, "day_ahead": 96, "week_ahead": 672}
+HORIZONS = {"hour_ahead": 4, "ultrashort": 16, "day_ahead": 96, "week_ahead": 672}
 KINDS = {"weather", "energy", "combined"}
 TRIGGERS = {"manual", "scheduled", "api", "seed"}
 WEATHER_TARGETS = ("wind_speed_mps", "temperature_c", "solar_radiation_wm2")
@@ -103,6 +105,86 @@ def load_observation_frame(point_id: str | None) -> pd.DataFrame:
     return frame.sort_values("timestamp").dropna(subset=[*WEATHER_TARGETS, *ENERGY_TARGETS]).reset_index(drop=True)
 
 
+def load_weather_observation_frame(point_id: str | None) -> pd.DataFrame:
+    """Read the local micro-weather history without requiring energy fields."""
+    if not point_id:
+        return pd.DataFrame()
+    with DB.connection() as conn:
+        rows = conn.execute(
+            """SELECT timestamp_utc AS timestamp,wind_speed_mps,temperature_c,solar_radiation_wm2,source
+               FROM weather_observations WHERE point_id=? ORDER BY timestamp_utc""",
+            (point_id,),
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame([dict(row) for row in rows])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    for column in WEATHER_TARGETS:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.sort_values("timestamp").dropna(subset=list(WEATHER_TARGETS)).reset_index(drop=True)
+
+
+def point_record(point_id: str) -> dict[str, object] | None:
+    return next((point for point in DB.list_points() if point["id"] == point_id), None)
+
+
+def forecast_anchor(frame: pd.DataFrame) -> pd.Timestamp:
+    """Return the latest usable observation, or the current 15-minute bucket."""
+    if not frame.empty and "timestamp" in frame.columns:
+        timestamp = pd.Timestamp(frame["timestamp"].max())
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        return timestamp.tz_convert("UTC")
+    return pd.Timestamp(now_dt()).floor("15min")
+
+
+def nwp_weather_frame(point_id: str, horizon: str, future_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """Load cached NWP, then try Open-Meteo, and retain a deterministic fallback."""
+    cached = DB.list_nwp_forecasts(point_id, horizon, max(horizon_count(horizon) * 4, 96))
+    nwp = pd.DataFrame(cached)
+    if not nwp.empty:
+        nwp["timestamp"] = pd.to_datetime(nwp["target_time_utc"], utc=True)
+        nwp = nwp.sort_values(["timestamp", "issued_at_utc"]).drop_duplicates("timestamp", keep="last")
+        nwp = nwp.set_index("timestamp").reindex(future_index)
+        nwp = nwp[list(WEATHER_TARGETS)].apply(pd.to_numeric, errors="coerce")
+        if nwp.notna().all(axis=1).sum() >= max(1, len(future_index) // 2):
+            return nwp.interpolate(method="time").ffill().bfill()
+
+    point = point_record(point_id)
+    provider_frame = pd.DataFrame()
+    if point and point.get("lat") is not None and point.get("lon") is not None:
+        try:
+            provider_frame = OpenMeteoProvider(float(point["lat"]), float(point["lon"]), timeout=5).forecast(future_index[0], future_index[-1])
+        except Exception as exc:  # network availability must not stop local forecasting
+            print(f"[nwp] Open-Meteo unavailable for {point_id}: {exc}")
+    if provider_frame.empty:
+        template = pd.DataFrame(load_template_rows(horizon))
+        provider_frame = template.set_index(pd.to_datetime(template["timestamp"], utc=True))[list(WEATHER_TARGETS)]
+        provider_frame.index = future_index[: len(provider_frame)]
+    provider_frame = provider_frame.reindex(future_index).interpolate(method="time").ffill().bfill()
+    issued_at = now_iso()
+    rows = [
+        {
+            "source_id": "openmeteo-icon", "point_id": point_id, "issued_at_utc": issued_at,
+            "target_time_utc": index.isoformat(), "horizon": horizon,
+            **{column: float(row[column]) for column in WEATHER_TARGETS}, "quality_score": 0.9,
+        }
+        for index, row in provider_frame.iterrows()
+    ]
+    try:
+        DB.save_nwp_forecasts(rows)
+    except Exception as exc:
+        print(f"[nwp] cache write failed for {point_id}: {exc}")
+    return provider_frame
+
+
+def fused_future_weather(point_id: str, horizon: str, future_index: pd.DatetimeIndex, local: pd.DataFrame | None = None) -> pd.DataFrame:
+    nwp = nwp_weather_frame(point_id, horizon, future_index)
+    bias_window = int(DB.get_settings().get("biasWindow", 96) or 96)
+    fused = fuse_weather(nwp, local=local, bias_window=bias_window)
+    return fused.reindex(future_index)[list(WEATHER_TARGETS)].interpolate(method="time").ffill().bfill()
+
+
 def load_template_rows(horizon: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with DATA.open(encoding="utf-8-sig", newline="") as stream:
@@ -150,7 +232,8 @@ def train_model(point_id: str | None, target_kind: str, horizon: str, mode: str,
     model_id = new_id("MDL")
     DB.create_training_run(training_id, point_id, target_kind, horizon, mode, window_size, None)
     try:
-        frame = load_observation_frame(point_id)
+        training_targets = WEATHER_TARGETS if target_kind == "weather" else ENERGY_TARGETS if target_kind == "energy" else (*WEATHER_TARGETS, *ENERGY_TARGETS)
+        frame = load_weather_observation_frame(point_id) if target_kind == "weather" else load_observation_frame(point_id)
         if len(frame) < 64:
             frame = load_demo_frame()
         if mode == "rolling":
@@ -162,9 +245,9 @@ def train_model(point_id: str | None, target_kind: str, horizon: str, mode: str,
             raise ValueError("not enough historical rows for training")
         train_frame = train_frame.set_index("timestamp")
         test_frame = test_frame.set_index("timestamp")
-        pipeline = IntegratedForecastPipeline().fit(train_frame)
+        pipeline = IntegratedForecastPipeline().fit(train_frame, targets=training_targets)
         prediction = pipeline.predict(len(test_frame), future_weather=test_frame[list(WEATHER_TARGETS)])
-        metrics: dict[str, object] = {target: metric_values(test_frame[target], prediction[target]) for target in (*WEATHER_TARGETS, *ENERGY_TARGETS)}
+        metrics: dict[str, object] = {target: metric_values(test_frame[target], prediction[target]) for target in training_targets}
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         artifact = {"model_id": model_id, "model_type": "ridge15min", "target_kind": target_kind, "horizon": horizon, "feature_count": pipeline.model.feature_count if pipeline.model else 0, "coefficients": {key: value.tolist() for key, value in (pipeline.model.coefficients.items() if pipeline.model else [])}}
         artifact_path = MODEL_DIR / f"{model_id}.json"
@@ -209,16 +292,24 @@ def evaluate_run(run_id: str) -> dict[str, object]:
 
 def execute_run(run_id: str, point_id: str, kind: str, horizon: str) -> dict[str, object]:
     try:
-        history = load_observation_frame(point_id)
-        if len(history) >= 64:
+        local_weather = load_weather_observation_frame(point_id)
+        if kind == "weather":
+            history = local_weather if len(local_weather) >= 64 else load_demo_frame()[["timestamp", *WEATHER_TARGETS]]
             history_indexed = history.set_index("timestamp")
-            future_index = make_future_index(history_indexed.index[-1], horizon)
-            template = pd.DataFrame(load_template_rows(horizon))
-            future_weather = template[list(WEATHER_TARGETS)].set_axis(future_index)
-            predictions = IntegratedForecastPipeline().fit(history_indexed).predict(horizon, future_weather=future_weather)
-            rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}} for index, row in predictions.iterrows()]
+            future_index = make_future_index(forecast_anchor(local_weather), horizon)
+            future_weather = fused_future_weather(point_id, horizon, future_index, local=local_weather)
+            predictions = IntegratedForecastPipeline().fit(history_indexed, targets=WEATHER_TARGETS).predict(horizon, future_weather=future_weather)
+            rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "source": "NWP + 本地微气象校正"} for index, row in predictions.iterrows()]
         else:
-            rows = load_template_rows(horizon)
+            history = load_observation_frame(point_id)
+            source_history = history if len(history) >= 64 else load_demo_frame()
+            history_indexed = source_history.set_index("timestamp")
+            anchor_source = history if not history.empty else local_weather
+            future_index = make_future_index(forecast_anchor(anchor_source), horizon)
+            future_weather = fused_future_weather(point_id, horizon, future_index, local=local_weather)
+            targets = ENERGY_TARGETS if kind == "energy" else (*WEATHER_TARGETS, *ENERGY_TARGETS)
+            predictions = IntegratedForecastPipeline().fit(history_indexed, targets=targets).predict(horizon, future_weather=future_weather)
+            rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "source": "NWP + 本地微气象校正"} for index, row in predictions.iterrows()]
         written = DB.save_forecast_rows(run_id, point_id, horizon, rows, kind, "Ridge 15分钟基线", "NWP + 本地校正")
         return {"run_id": run_id, "status": "success", "rows_written": written, "evaluation": evaluate_run(run_id)}
     except Exception as exc:
@@ -303,7 +394,10 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         try:
-            if parsed.path == "/api/health":
+            if parsed.path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+            elif parsed.path == "/api/health":
                 self.json_response({**DB.health(), "time": now_iso(), "scheduler": "enabled"})
             elif parsed.path == "/api/points":
                 self.json_response({"points": DB.list_points()})
@@ -337,6 +431,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({"evaluations": DB.list_evaluations(query.get("run_id", [None])[0], query.get("point_id", [None])[0], int(query.get("limit", [100])[0]))})
             elif parsed.path == "/api/weather-observations":
                 self.json_response({"observations": DB.list_weather_observations(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
+            elif parsed.path == "/api/nwp-forecasts":
+                self.json_response({"forecasts": DB.list_nwp_forecasts(query.get("point_id", [None])[0], query.get("horizon", [None])[0], query.get("limit", [672])[0])})
             elif parsed.path == "/api/energy-measurements":
                 self.json_response({"measurements": DB.list_energy_measurements(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
             else:
@@ -360,10 +456,15 @@ class Handler(BaseHTTPRequestHandler):
                 disabled = [str(point_id) for point_id in point_ids if str(point_id) in known_points and not known_points[str(point_id)]["enabled"]]
                 if unknown: raise ValueError(f"unknown point_ids: {', '.join(unknown)}")
                 if disabled: raise ValueError(f"disabled point_ids: {', '.join(disabled)}")
+                scheduled_at = payload.get("scheduled_at")
+                if scheduled_at is not None and str(scheduled_at).strip():
+                    scheduled_at = parse_dt(scheduled_at).isoformat()
+                else:
+                    scheduled_at = None
                 run_results = []
                 for point_id in point_ids:
-                    run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, payload.get("scheduled_at"))
-                    if payload.get("scheduled_at") and parse_dt(payload["scheduled_at"]) > now_dt():
+                    run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, scheduled_at)
+                    if scheduled_at and parse_dt(scheduled_at) > now_dt():
                         run_results.append({"run_id": run_id, "status": "accepted"})
                     else:
                         run_results.append(execute_run(run_id, str(point_id), kind, horizon))
@@ -389,6 +490,8 @@ class Handler(BaseHTTPRequestHandler):
                 point = point_payload(payload); DB.upsert_point(point); self.json_response({"status": "saved", "point": next(item for item in DB.list_points() if item["id"] == point["id"])})
             elif parsed.path == "/api/weather-observations":
                 rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_weather_observations(rows)})
+            elif parsed.path == "/api/nwp-forecasts":
+                rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_nwp_forecasts(rows)})
             elif parsed.path == "/api/energy-measurements":
                 rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_energy_measurements(rows)})
             else:

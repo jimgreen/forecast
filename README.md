@@ -11,7 +11,7 @@
                                              └─ 负荷
 ```
 
-预测尺度统一为：超短期 4 小时（16 点）、日前 24 小时（96 点）、周前 7 天（672 点），间隔均为 15 分钟。当前本地实现提供可审计的 Ridge 基线；后续可把模型替换为 `vendor/` 中的 OpenSTEF、Quartz、hefty 或 `loadforecasting` 模型，数据契约不变。
+预测尺度统一为：小时前 1 小时（4 点）、超短期 4 小时（16 点）、日前 24 小时（96 点）、周前 7 天（672 点），间隔均为 15 分钟。当前本地实现提供可审计的 Ridge 基线；后续可把模型替换为 `vendor/` 中的 OpenSTEF、Quartz、hefty 或 `loadforecasting` 模型，数据契约不变。
 
 ## 已下载的开源上游
 
@@ -48,6 +48,7 @@ pipeline = IntegratedForecastPipeline(
     provider=OpenMeteoProvider(latitude=-36.85, longitude=174.76)
 ).fit(observations)
 
+hour_ahead = pipeline.predict("hour_ahead")
 ultrashort = pipeline.predict("ultrashort")
 day_ahead = pipeline.predict("day_ahead")
 week_ahead = pipeline.predict("week_ahead")
@@ -85,13 +86,13 @@ cd D:\codex\forecast
 python scripts\init_forecast_db.py
 ```
 
-初始化会创建 schema、默认预测点、Open-Meteo/NOAA NWP 数据源配置，并把示例周前预测写入数据库。开发环境如需重建，可使用 `python scripts\init_forecast_db.py --reset`。数据库包含预测点、预测任务运行记录、气象历史/实时观测、NWP/融合天气预测、新能源与负荷测量、光伏/风电/负荷预测结果、NWP 数据源、任务配置、模型注册、训练运行、滚动更新、自动调度和结果评估表。服务 API `/api/health`、`/api/points`、`/api/forecast`、`/api/runs`、`/api/weather-observations` 和 `/api/energy-measurements` 均读写这套 SQLite 数据。生产环境应同时备份 `forecast.db`、`forecast.db-wal` 和 `forecast.db-shm` 文件。可通过环境变量 `FORECAST_DB_PATH` 覆盖默认路径。
+初始化会创建 schema、默认预测点、Open-Meteo/NOAA NWP 数据源配置，并把示例周前预测写入数据库。开发环境如需重建，可使用 `python scripts\init_forecast_db.py --reset`。数据库包含预测点、预测任务运行记录、气象历史/实时观测、缓存的 NWP 原始预测、NWP/融合天气预测、新能源与负荷测量、光伏/风电/负荷预测结果、NWP 数据源、任务配置、模型注册、训练运行、滚动更新、自动调度和结果评估表。服务 API `/api/health`、`/api/points`、`/api/forecast`、`/api/nwp-forecasts`、`/api/runs`、`/api/weather-observations` 和 `/api/energy-measurements` 均读写这套 SQLite 数据。天气运行会优先使用缓存 NWP，缓存不足时请求 Open-Meteo，并使用本地微气象观测做滚动偏差修正。生产环境应同时备份 `forecast.db`、`forecast.db-wal` 和 `forecast.db-shm` 文件。可通过环境变量 `FORECAST_DB_PATH` 覆盖默认路径。
 
 模型和任务闭环还包括：
 
 - `POST /api/train`：离线训练 Ridge 15 分钟基线，保存模型版本、系数文件、训练样本数和验证指标。
 - `POST /api/model-update`：按最近窗口执行滚动更新，登记 `model_updates` 更新记录。
-- `POST /api/run`：人工启动或指定未来启动时刻；立即任务会生成预测、写入 `forecast_runs` 并创建后评估记录。
+- `POST /api/run`：人工启动或指定未来启动时刻；支持小时前、超短期、日前和周前周期，立即任务会生成预测、写入 `forecast_runs` 并创建后评估记录。
 - `GET/POST /api/schedules`：配置自动定时预测；服务内置调度线程按 `next_run_at` 和 `cadence_minutes` 执行任务。
 - `GET /api/evaluations`、`POST /api/evaluate`：将预测与同点位实测值按 15 分钟时间戳对齐，计算 MAE、RMSE、BIAS 和 nMAE；实际值尚未到达时记录为 `pending`，补齐后可再次评估。
 

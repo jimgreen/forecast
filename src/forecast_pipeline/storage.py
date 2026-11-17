@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 DEFAULT_DB_PATH = Path(os.environ.get("FORECAST_DB_PATH", r"D:\codex\sqldb\realtime\forecast\forecast.db"))
 
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS forecast_runs (
     run_id TEXT PRIMARY KEY,
     point_id TEXT,
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK(trigger_type IN ('manual', 'scheduled', 'api', 'seed')),
     scheduled_at TEXT,
     started_at TEXT NOT NULL,
@@ -130,11 +130,26 @@ CREATE TABLE IF NOT EXISTS nwp_sources (
     last_sync_at TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS nwp_forecasts (
+    source_id TEXT NOT NULL,
+    point_id TEXT NOT NULL,
+    issued_at_utc TEXT NOT NULL,
+    target_time_utc TEXT NOT NULL,
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
+    wind_speed_mps REAL,
+    temperature_c REAL,
+    solar_radiation_wm2 REAL,
+    quality_score REAL,
+    received_at TEXT NOT NULL,
+    PRIMARY KEY(source_id, point_id, issued_at_utc, target_time_utc),
+    FOREIGN KEY(source_id) REFERENCES nwp_sources(source_id),
+    FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
+);
 CREATE TABLE IF NOT EXISTS forecast_tasks (
     task_id TEXT PRIMARY KEY,
     point_id TEXT NOT NULL,
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
     schedule_time TEXT,
     timezone TEXT NOT NULL DEFAULT 'Pacific/Auckland',
@@ -146,7 +161,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
     model_name TEXT NOT NULL,
     model_type TEXT NOT NULL,
     target_kind TEXT NOT NULL CHECK(target_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     point_id TEXT,
     version TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('training', 'active', 'retired', 'failed')),
@@ -162,7 +177,7 @@ CREATE TABLE IF NOT EXISTS training_runs (
     model_id TEXT,
     point_id TEXT,
     target_kind TEXT NOT NULL CHECK(target_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     training_mode TEXT NOT NULL CHECK(training_mode IN ('offline', 'rolling')),
     window_size INTEGER,
     sample_count INTEGER NOT NULL DEFAULT 0,
@@ -178,7 +193,7 @@ CREATE TABLE IF NOT EXISTS model_updates (
     update_id TEXT PRIMARY KEY,
     model_id TEXT NOT NULL,
     point_id TEXT,
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     update_strategy TEXT NOT NULL CHECK(update_strategy IN ('rolling_window', 'incremental', 'retrain')),
     window_size INTEGER,
     sample_count INTEGER NOT NULL DEFAULT 0,
@@ -193,7 +208,7 @@ CREATE TABLE IF NOT EXISTS forecast_schedules (
     name TEXT NOT NULL,
     point_ids_json TEXT NOT NULL DEFAULT '[]',
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
     cadence_minutes INTEGER NOT NULL DEFAULT 1440,
     next_run_at TEXT,
@@ -206,7 +221,7 @@ CREATE TABLE IF NOT EXISTS forecast_evaluations (
     run_id TEXT NOT NULL,
     point_id TEXT,
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
-    horizon TEXT NOT NULL CHECK(horizon IN ('ultrashort', 'day_ahead', 'week_ahead')),
+    horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     window_start TEXT,
     window_end TEXT,
     sample_count INTEGER NOT NULL DEFAULT 0,
@@ -223,6 +238,7 @@ CREATE TABLE IF NOT EXISTS forecast_evaluations (
 );
 CREATE INDEX IF NOT EXISTS idx_weather_obs_point_time ON weather_observations(point_id, timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_weather_fc_point_target ON weather_forecasts(point_id, target_time_utc);
+CREATE INDEX IF NOT EXISTS idx_nwp_fc_point_target ON nwp_forecasts(point_id, target_time_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_meas_point_time ON energy_measurements(point_id, timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_energy_fc_point_target ON energy_forecasts(point_id, target_time_utc);
 CREATE INDEX IF NOT EXISTS idx_runs_point_started ON forecast_runs(point_id, started_at DESC);
@@ -261,6 +277,11 @@ class ForecastDB:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(forecast_points)")}
             if "objects_json" not in columns:
                 conn.execute("ALTER TABLE forecast_points ADD COLUMN objects_json TEXT NOT NULL DEFAULT '[\"pv\", \"wind\", \"load\"]'")
+            version_row = conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+            current_version = int(version_row["value"]) if version_row else 0
+            if current_version < 3:
+                self._migrate_horizon_checks(conn)
+                conn.executescript(SCHEMA_SQL)
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute(
@@ -268,6 +289,33 @@ class ForecastDB:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(SCHEMA_VERSION),),
             )
+
+    @staticmethod
+    def _migrate_horizon_checks(conn: sqlite3.Connection) -> None:
+        """Rebuild legacy tables whose SQLite CHECK omitted ``hour_ahead``."""
+        tables = (
+            "forecast_runs", "weather_forecasts", "energy_forecasts", "forecast_tasks",
+            "model_registry", "training_runs", "model_updates", "forecast_schedules",
+            "forecast_evaluations",
+        )
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            for table in tables:
+                row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+                if not row or not row["sql"] or "hour_ahead" in row["sql"]:
+                    continue
+                temp = f"{table}__v3"
+                create_sql = row["sql"].replace(f"CREATE TABLE {table}", f"CREATE TABLE {temp}", 1)
+                create_sql = create_sql.replace("'ultrashort', 'day_ahead', 'week_ahead'", "'hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead'")
+                conn.execute(create_sql)
+                columns = [info["name"] for info in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+                names = ",".join(columns)
+                conn.execute(f"INSERT INTO {temp} ({names}) SELECT {names} FROM {table}")
+                conn.execute(f"DROP TABLE {table}")
+                conn.execute(f"ALTER TABLE {temp} RENAME TO {table}")
+        finally:
+            conn.execute("PRAGMA foreign_keys=ON")
 
     def seed_defaults(self) -> None:
         now = utc_now()
@@ -304,7 +352,7 @@ class ForecastDB:
                 ("SCH-DEFAULT-DAY-AHEAD", "默认日前预测", json.dumps(["P001", "P002", "P003"]), "combined", "day_ahead", 1440, now, now),
             )
             for point_id in ("P001", "P002", "P003"):
-                for horizon, schedule_time in (("ultrashort", "每15分钟"), ("day_ahead", "06:00"), ("week_ahead", "06:30")):
+                for horizon, schedule_time in (("hour_ahead", "每小时"), ("ultrashort", "每15分钟"), ("day_ahead", "06:00"), ("week_ahead", "06:30")):
                     conn.execute(
                         """INSERT INTO forecast_tasks(task_id,point_id,forecast_kind,horizon,enabled,schedule_time,timezone,updated_at)
                         VALUES(?,?,?,?,1,?,?,?) ON CONFLICT(task_id) DO NOTHING""",
@@ -510,6 +558,36 @@ class ForecastDB:
                 (source["source_id"], source.get("name", source["source_id"]), source.get("provider", "custom"), source.get("model_name", "custom"), source.get("endpoint"), int(source.get("refresh_minutes", 60)), json.dumps(source.get("variables", []), ensure_ascii=False), int(bool(source.get("enabled", True))), source.get("status", "configured"), source.get("last_sync_at"), now),
             )
 
+    def save_nwp_forecasts(self, rows: Iterable[Mapping[str, object]]) -> int:
+        count = 0
+        with self.connection() as conn:
+            for row in rows:
+                conn.execute(
+                    """INSERT OR REPLACE INTO nwp_forecasts
+                    (source_id,point_id,issued_at_utc,target_time_utc,horizon,wind_speed_mps,temperature_c,solar_radiation_wm2,quality_score,received_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        row["source_id"], row["point_id"], row["issued_at_utc"], row["target_time_utc"],
+                        row.get("horizon", "day_ahead"), row.get("wind_speed_mps"), row.get("temperature_c"),
+                        row.get("solar_radiation_wm2"), row.get("quality_score", 0.9), row.get("received_at", utc_now()),
+                    ),
+                )
+                count += 1
+        return count
+
+    def list_nwp_forecasts(self, point_id: str | None = None, horizon: str | None = None, limit: int | str = 672) -> list[dict[str, object]]:
+        limit = min(max(int(limit), 1), 5000)
+        clauses = []
+        params: list[object] = []
+        if point_id:
+            clauses.append("point_id=?"); params.append(point_id)
+        if horizon:
+            clauses.append("horizon=?"); params.append(horizon)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection() as conn:
+            rows = conn.execute(f"SELECT * FROM nwp_forecasts{where} ORDER BY target_time_utc LIMIT ?", (*params, limit)).fetchall()
+        return [dict(row) for row in rows]
+
     def list_tasks(self, point_id: str | None = None) -> list[dict[str, object]]:
         with self.connection() as conn:
             if point_id:
@@ -674,7 +752,7 @@ class ForecastDB:
     def health(self) -> dict[str, object]:
         with self.connection() as conn:
             tables = {}
-            for table in ("forecast_points", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "nwp_sources", "forecast_tasks", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations"):
+            for table in ("forecast_points", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "nwp_sources", "nwp_forecasts", "forecast_tasks", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations"):
                 tables[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {"status": "ok", "path": str(self.path), "schema_version": SCHEMA_VERSION, "tables": tables}
 

@@ -36,10 +36,11 @@ class OpenMeteoProvider:
     latitude: float
     longitude: float
     timezone: str = "UTC"
+    timeout: int = 10
 
     def _query(self, endpoint: str, params: dict[str, Any]) -> dict[str, Any]:
         query = urlencode({k: v for k, v in params.items() if v is not None})
-        return _get_json(f"{endpoint}?{query}")
+        return _get_json(f"{endpoint}?{query}", timeout=self.timeout)
 
     @staticmethod
     def _frame(payload: dict[str, Any], section: str) -> pd.DataFrame:
