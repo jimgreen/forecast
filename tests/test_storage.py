@@ -76,3 +76,32 @@ def test_hour_weather_and_nwp_cache_roundtrip(tmp_path):
         "temperature_c": 15.0,
         "solar_radiation_wm2": 120.0,
     }], kind="weather") == 1
+
+
+def test_object_scope_and_curtailment_roundtrip(tmp_path):
+    db = ForecastDB(tmp_path / "forecast.db")
+    db.initialize()
+    db.seed_defaults()
+    objects = db.list_objects()
+    assert any(item["object_id"] == "OBJ-GRID" and item["object_type"] == "grid" for item in objects)
+    assert db.save_energy_measurements([{
+        "point_id": "P001",
+        "timestamp_utc": "2026-01-01T00:00:00Z",
+        "pv_power_kw": 50.0,
+        "pv_available_power_kw": 80.0,
+        "wind_power_kw": 10.0,
+        "wind_available_power_kw": 10.0,
+        "load_kw": 20.0,
+    }]) == 1
+    measurement = db.list_energy_measurements("P001")[0]
+    assert measurement["curtailment_flag"] == 1
+    assert measurement["pv_curtailment_kw"] == 30.0
+    db.create_run("OBJ-RUN", "P001", "energy", "hour_ahead", object_id="OBJ-GRID")
+    db.save_forecast_rows("OBJ-RUN", "P001", "hour_ahead", [{
+        "timestamp": "2026-01-01T01:00:00Z",
+        "pv_power_kw": 80.0,
+        "wind_power_kw": 10.0,
+        "load_kw": 20.0,
+    }], kind="energy")
+    assert db.list_runs(1)[0]["object_id"] == "OBJ-GRID"
+    assert db.get_forecast_rows("P001", "hour_ahead", 4, object_id="OBJ-GRID")[0]["pv_power_kw"] == 80.0

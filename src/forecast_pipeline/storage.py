@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 DEFAULT_DB_PATH = Path(os.environ.get("FORECAST_DB_PATH", r"D:\codex\sqldb\realtime\forecast\forecast.db"))
 
@@ -46,9 +46,25 @@ CREATE TABLE IF NOT EXISTS forecast_points (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS forecast_objects (
+    object_id TEXT PRIMARY KEY,
+    point_id TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    object_type TEXT NOT NULL CHECK(object_type IN ('grid', 'plant', 'unit', 'point')),
+    technology TEXT NOT NULL DEFAULT 'mixed' CHECK(technology IN ('wind', 'pv', 'mixed', 'load', 'unknown')),
+    parent_object_id TEXT,
+    capacity_kw REAL NOT NULL DEFAULT 0,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(point_id) REFERENCES forecast_points(point_id),
+    FOREIGN KEY(parent_object_id) REFERENCES forecast_objects(object_id)
+);
 CREATE TABLE IF NOT EXISTS forecast_runs (
     run_id TEXT PRIMARY KEY,
     point_id TEXT,
+    object_id TEXT,
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
     horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     trigger_type TEXT NOT NULL DEFAULT 'manual' CHECK(trigger_type IN ('manual', 'scheduled', 'api', 'seed')),
@@ -95,6 +111,12 @@ CREATE TABLE IF NOT EXISTS energy_measurements (
     pv_power_kw REAL,
     wind_power_kw REAL,
     load_kw REAL,
+    pv_available_power_kw REAL,
+    wind_available_power_kw REAL,
+    pv_curtailment_kw REAL,
+    wind_curtailment_kw REAL,
+    curtailment_flag INTEGER NOT NULL DEFAULT 0 CHECK(curtailment_flag IN (0, 1)),
+    curtailment_reason TEXT,
     source TEXT NOT NULL,
     quality_code TEXT NOT NULL DEFAULT 'valid',
     is_realtime INTEGER NOT NULL DEFAULT 0 CHECK(is_realtime IN (0, 1)),
@@ -111,6 +133,9 @@ CREATE TABLE IF NOT EXISTS energy_forecasts (
     pv_power_kw REAL,
     wind_power_kw REAL,
     load_kw REAL,
+    pv_available_power_kw REAL,
+    wind_available_power_kw REAL,
+    prediction_basis TEXT NOT NULL DEFAULT 'available_power',
     model_name TEXT NOT NULL,
     quality_score REAL,
     PRIMARY KEY(run_id, target_time_utc),
@@ -207,6 +232,7 @@ CREATE TABLE IF NOT EXISTS forecast_schedules (
     schedule_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     point_ids_json TEXT NOT NULL DEFAULT '[]',
+    object_ids_json TEXT NOT NULL DEFAULT '[]',
     forecast_kind TEXT NOT NULL CHECK(forecast_kind IN ('weather', 'energy', 'combined')),
     horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
@@ -236,6 +262,21 @@ CREATE TABLE IF NOT EXISTS forecast_evaluations (
     FOREIGN KEY(run_id) REFERENCES forecast_runs(run_id),
     FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
 );
+CREATE TABLE IF NOT EXISTS curtailment_events (
+    event_id TEXT PRIMARY KEY,
+    point_id TEXT NOT NULL,
+    object_id TEXT,
+    start_time_utc TEXT NOT NULL,
+    end_time_utc TEXT NOT NULL,
+    technology TEXT NOT NULL CHECK(technology IN ('wind', 'pv', 'mixed', 'unknown')),
+    available_power_kw REAL,
+    measured_power_kw REAL,
+    curtailed_power_kw REAL,
+    reason TEXT,
+    source TEXT NOT NULL DEFAULT 'local',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
+);
 CREATE INDEX IF NOT EXISTS idx_weather_obs_point_time ON weather_observations(point_id, timestamp_utc);
 CREATE INDEX IF NOT EXISTS idx_weather_fc_point_target ON weather_forecasts(point_id, target_time_utc);
 CREATE INDEX IF NOT EXISTS idx_nwp_fc_point_target ON nwp_forecasts(point_id, target_time_utc);
@@ -246,6 +287,7 @@ CREATE INDEX IF NOT EXISTS idx_models_point_horizon ON model_registry(point_id, 
 CREATE INDEX IF NOT EXISTS idx_training_started ON training_runs(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_schedule_next_run ON forecast_schedules(enabled, next_run_at);
 CREATE INDEX IF NOT EXISTS idx_eval_run ON forecast_evaluations(run_id, evaluated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_curtailment_point_time ON curtailment_events(point_id, start_time_utc);
 """
 
 
@@ -282,6 +324,10 @@ class ForecastDB:
             if current_version < 3:
                 self._migrate_horizon_checks(conn)
                 conn.executescript(SCHEMA_SQL)
+            if current_version < 5:
+                self._migrate_v4(conn)
+                conn.executescript(SCHEMA_SQL)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_object_started ON forecast_runs(object_id, started_at DESC)")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.execute(
@@ -317,6 +363,64 @@ class ForecastDB:
         finally:
             conn.execute("PRAGMA foreign_keys=ON")
 
+    @staticmethod
+    def _migrate_v4(conn: sqlite3.Connection) -> None:
+        """Add object scope and curtailment provenance without rewriting data."""
+        columns = {
+            "forecast_runs": {"object_id": "TEXT"},
+            "forecast_schedules": {"object_ids_json": "TEXT NOT NULL DEFAULT '[]'"},
+            "energy_measurements": {
+                "pv_available_power_kw": "REAL",
+                "wind_available_power_kw": "REAL",
+                "pv_curtailment_kw": "REAL",
+                "wind_curtailment_kw": "REAL",
+                "curtailment_flag": "INTEGER NOT NULL DEFAULT 0",
+                "curtailment_reason": "TEXT",
+            },
+            "energy_forecasts": {
+                "pv_available_power_kw": "REAL",
+                "wind_available_power_kw": "REAL",
+                "prediction_basis": "TEXT NOT NULL DEFAULT 'available_power'",
+            },
+        }
+        for table, additions in columns.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in additions.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS forecast_objects (
+                object_id TEXT PRIMARY KEY,
+                point_id TEXT NOT NULL,
+                object_name TEXT NOT NULL,
+                object_type TEXT NOT NULL,
+                technology TEXT NOT NULL DEFAULT 'mixed',
+                parent_object_id TEXT,
+                capacity_kw REAL NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS curtailment_events (
+                event_id TEXT PRIMARY KEY,
+                point_id TEXT NOT NULL,
+                object_id TEXT,
+                start_time_utc TEXT NOT NULL,
+                end_time_utc TEXT NOT NULL,
+                technology TEXT NOT NULL,
+                available_power_kw REAL,
+                measured_power_kw REAL,
+                curtailed_power_kw REAL,
+                reason TEXT,
+                source TEXT NOT NULL DEFAULT 'local',
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        conn.execute("UPDATE forecast_runs SET object_id=point_id WHERE object_id IS NULL")
+
     def seed_defaults(self) -> None:
         now = utc_now()
         points = [
@@ -343,6 +447,23 @@ class ForecastDB:
                     VALUES(?,?,?,?,?,?,?,1,'configured',?)
                     ON CONFLICT(source_id) DO NOTHING""",
                     (source_id, name, provider, model, endpoint, refresh, json.dumps(variables, ensure_ascii=False), now),
+                )
+            objects = [
+                ("OBJ-GRID", "P001", "全网风光汇总", "grid", "mixed", None, 200.0),
+                ("OBJ-WIND-P002", "P002", "北侧风机群", "plant", "wind", "OBJ-GRID", 420.0),
+                ("OBJ-WIND-P002-U01", "P002", "北侧风机 WT-001", "unit", "wind", "OBJ-WIND-P002", 420.0),
+                ("OBJ-PV-P001-U01", "P001", "南岛光伏 PV-001", "unit", "pv", "OBJ-GRID", 120.0),
+                ("OBJ-LOAD-P003", "P003", "园区负荷汇总", "grid", "load", None, 0.0),
+            ]
+            for object_id, point_id, name, object_type, technology, parent_id, capacity in objects:
+                conn.execute(
+                    """INSERT INTO forecast_objects
+                    (object_id,point_id,object_name,object_type,technology,parent_object_id,capacity_kw,enabled,metadata_json,created_at,updated_at)
+                    VALUES(?,?,?,?,?,?,?,1,'{}',?,?)
+                    ON CONFLICT(object_id) DO UPDATE SET point_id=excluded.point_id,object_name=excluded.object_name,
+                    object_type=excluded.object_type,technology=excluded.technology,parent_object_id=excluded.parent_object_id,
+                    capacity_kw=excluded.capacity_kw,updated_at=excluded.updated_at""",
+                    (object_id, point_id, name, object_type, technology, parent_id, capacity, now, now),
                 )
             conn.execute(
                 """INSERT INTO forecast_schedules
@@ -417,11 +538,59 @@ class ForecastDB:
             objects.append("load")
         return objects or ["load"]
 
-    def create_run(self, run_id: str, point_id: str | None, kind: str, horizon: str, trigger: str = "manual", scheduled_at: str | None = None) -> None:
+    def list_objects(self, object_id: str | None = None, enabled_only: bool = False) -> list[dict[str, object]]:
+        clauses = []
+        params: list[object] = []
+        if object_id:
+            clauses.append("o.object_id=?")
+            params.append(object_id)
+        if enabled_only:
+            clauses.append("o.enabled=1")
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT o.*,p.name AS point_name,p.point_type,p.latitude,p.longitude
+                    FROM forecast_objects o JOIN forecast_points p ON p.point_id=o.point_id{where}
+                    ORDER BY o.object_type,o.object_id""",
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["enabled"] = bool(item["enabled"])
+            item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+            result.append(item)
+        return result
+
+    def upsert_object(self, obj: Mapping[str, object]) -> None:
+        now = utc_now()
         with self.connection() as conn:
             conn.execute(
-                "INSERT INTO forecast_runs(run_id,point_id,forecast_kind,horizon,trigger_type,scheduled_at,started_at,status) VALUES(?,?,?,?,?,?,?,'accepted')",
-                (run_id, point_id, kind, horizon, trigger, scheduled_at, utc_now()),
+                """INSERT INTO forecast_objects
+                (object_id,point_id,object_name,object_type,technology,parent_object_id,capacity_kw,enabled,metadata_json,created_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(object_id) DO UPDATE SET point_id=excluded.point_id,object_name=excluded.object_name,
+                object_type=excluded.object_type,technology=excluded.technology,parent_object_id=excluded.parent_object_id,
+                capacity_kw=excluded.capacity_kw,enabled=excluded.enabled,metadata_json=excluded.metadata_json,updated_at=excluded.updated_at""",
+                (
+                    obj["object_id"], obj["point_id"], obj.get("object_name", obj["object_id"]),
+                    obj.get("object_type", "point"), obj.get("technology", "mixed"), obj.get("parent_object_id"),
+                    float(obj.get("capacity_kw", 0) or 0), int(bool(obj.get("enabled", True))),
+                    json.dumps(obj.get("metadata", {}), ensure_ascii=False), obj.get("created_at", now), now,
+                ),
+            )
+
+    def resolve_object(self, object_id: str | None) -> dict[str, object] | None:
+        if not object_id:
+            return None
+        objects = self.list_objects(object_id)
+        return objects[0] if objects else None
+
+    def create_run(self, run_id: str, point_id: str | None, kind: str, horizon: str, trigger: str = "manual", scheduled_at: str | None = None, object_id: str | None = None) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "INSERT INTO forecast_runs(run_id,point_id,object_id,forecast_kind,horizon,trigger_type,scheduled_at,started_at,status) VALUES(?,?,?,?,?,?,?,?,'accepted')",
+                (run_id, point_id, object_id or point_id, kind, horizon, trigger, scheduled_at, utc_now()),
             )
 
     def finish_run(self, run_id: str, status: str, rows_written: int = 0, error_message: str | None = None) -> None:
@@ -519,12 +688,13 @@ class ForecastDB:
         point_ids = schedule.get("point_ids", [])
         with self.connection() as conn:
             conn.execute(
-                """INSERT INTO forecast_schedules(schedule_id,name,point_ids_json,forecast_kind,horizon,enabled,cadence_minutes,next_run_at,last_run_at,last_run_id,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO forecast_schedules(schedule_id,name,point_ids_json,object_ids_json,forecast_kind,horizon,enabled,cadence_minutes,next_run_at,last_run_at,last_run_id,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(schedule_id) DO UPDATE SET name=excluded.name,point_ids_json=excluded.point_ids_json,
+                object_ids_json=excluded.object_ids_json,
                 forecast_kind=excluded.forecast_kind,horizon=excluded.horizon,enabled=excluded.enabled,cadence_minutes=excluded.cadence_minutes,
                 next_run_at=excluded.next_run_at,updated_at=excluded.updated_at""",
-                (schedule["schedule_id"], schedule.get("name", "预测定时任务"), json.dumps(point_ids, ensure_ascii=False), schedule.get("forecast_kind", "combined"), schedule.get("horizon", "day_ahead"), int(bool(schedule.get("enabled", True))), int(schedule.get("cadence_minutes", 1440)), schedule.get("next_run_at"), schedule.get("last_run_at"), schedule.get("last_run_id"), now),
+                (schedule["schedule_id"], schedule.get("name", "预测定时任务"), json.dumps(point_ids, ensure_ascii=False), json.dumps(schedule.get("object_ids", []), ensure_ascii=False), schedule.get("forecast_kind", "combined"), schedule.get("horizon", "day_ahead"), int(bool(schedule.get("enabled", True))), int(schedule.get("cadence_minutes", 1440)), schedule.get("next_run_at"), schedule.get("last_run_at"), schedule.get("last_run_id"), now),
             )
 
     def list_schedules(self) -> list[dict[str, object]]:
@@ -532,7 +702,7 @@ class ForecastDB:
             rows = conn.execute("SELECT * FROM forecast_schedules ORDER BY name").fetchall()
         result = []
         for row in rows:
-            item = dict(row); item["point_ids"] = json.loads(item.pop("point_ids_json") or "[]"); item["enabled"] = bool(item["enabled"]); result.append(item)
+            item = dict(row); item["point_ids"] = json.loads(item.pop("point_ids_json") or "[]"); item["object_ids"] = json.loads(item.pop("object_ids_json", "[]") or "[]"); item["enabled"] = bool(item["enabled"]); result.append(item)
         return result
 
     def list_nwp_sources(self) -> list[dict[str, object]]:
@@ -672,13 +842,57 @@ class ForecastDB:
         count = 0
         with self.connection() as conn:
             for row in rows:
+                pv_actual = row.get("pv_power_kw")
+                wind_actual = row.get("wind_power_kw")
+                pv_available = row.get("pv_available_power_kw", row.get("available_pv_power_kw"))
+                wind_available = row.get("wind_available_power_kw", row.get("available_wind_power_kw"))
+                pv_loss = row.get("pv_curtailment_kw")
+                wind_loss = row.get("wind_curtailment_kw")
+                if pv_loss is None and pv_available is not None and pv_actual is not None:
+                    pv_loss = max(float(pv_available) - float(pv_actual), 0.0)
+                if wind_loss is None and wind_available is not None and wind_actual is not None:
+                    wind_loss = max(float(wind_available) - float(wind_actual), 0.0)
+                curtailment_flag = bool(row.get("curtailment_flag", False) or float(pv_loss or 0) > 1e-6 or float(wind_loss or 0) > 1e-6)
                 conn.execute(
-                    """INSERT INTO energy_measurements(point_id,timestamp_utc,pv_power_kw,wind_power_kw,load_kw,source,quality_code,is_realtime,received_at)
-                    VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(point_id,timestamp_utc,source) DO UPDATE SET pv_power_kw=excluded.pv_power_kw,wind_power_kw=excluded.wind_power_kw,load_kw=excluded.load_kw,quality_code=excluded.quality_code,is_realtime=excluded.is_realtime,received_at=excluded.received_at""",
-                    (row["point_id"], row["timestamp_utc"], row.get("pv_power_kw"), row.get("wind_power_kw"), row.get("load_kw"), row.get("source", "local"), row.get("quality_code", "valid"), int(bool(row.get("is_realtime", False))), row.get("received_at", utc_now())),
+                    """INSERT INTO energy_measurements
+                    (point_id,timestamp_utc,pv_power_kw,wind_power_kw,load_kw,pv_available_power_kw,wind_available_power_kw,
+                     pv_curtailment_kw,wind_curtailment_kw,curtailment_flag,curtailment_reason,source,quality_code,is_realtime,received_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(point_id,timestamp_utc,source) DO UPDATE SET pv_power_kw=excluded.pv_power_kw,
+                    wind_power_kw=excluded.wind_power_kw,load_kw=excluded.load_kw,pv_available_power_kw=excluded.pv_available_power_kw,
+                    wind_available_power_kw=excluded.wind_available_power_kw,pv_curtailment_kw=excluded.pv_curtailment_kw,
+                    wind_curtailment_kw=excluded.wind_curtailment_kw,curtailment_flag=excluded.curtailment_flag,
+                    curtailment_reason=excluded.curtailment_reason,quality_code=excluded.quality_code,is_realtime=excluded.is_realtime,received_at=excluded.received_at""",
+                    (row["point_id"], row["timestamp_utc"], pv_actual, wind_actual, row.get("load_kw"), pv_available,
+                     wind_available, pv_loss, wind_loss, int(curtailment_flag), row.get("curtailment_reason"),
+                     row.get("source", "local"), row.get("quality_code", "valid"), int(bool(row.get("is_realtime", False))), row.get("received_at", utc_now())),
                 )
                 count += 1
         return count
+
+    def save_curtailment_events(self, rows: Iterable[Mapping[str, object]]) -> int:
+        count = 0
+        with self.connection() as conn:
+            for row in rows:
+                conn.execute(
+                    """INSERT OR REPLACE INTO curtailment_events
+                    (event_id,point_id,object_id,start_time_utc,end_time_utc,technology,available_power_kw,measured_power_kw,curtailed_power_kw,reason,source,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (row["event_id"], row["point_id"], row.get("object_id"), row["start_time_utc"], row["end_time_utc"],
+                     row.get("technology", "unknown"), row.get("available_power_kw"), row.get("measured_power_kw"),
+                     row.get("curtailed_power_kw"), row.get("reason"), row.get("source", "local"), row.get("created_at", utc_now())),
+                )
+                count += 1
+        return count
+
+    def list_curtailment_events(self, point_id: str | None = None, limit: int | str = 100) -> list[dict[str, object]]:
+        limit = min(max(int(limit), 1), 2000)
+        with self.connection() as conn:
+            if point_id:
+                rows = conn.execute("SELECT * FROM curtailment_events WHERE point_id=? ORDER BY start_time_utc DESC LIMIT ?", (point_id, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM curtailment_events ORDER BY start_time_utc DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(row) for row in rows]
 
     def list_weather_observations(self, point_id: str | None = None, limit: int | str = 96) -> list[dict[str, object]]:
         limit = min(max(int(limit), 1), 2000)
@@ -710,20 +924,26 @@ class ForecastDB:
                     )
                 if kind in {"energy", "combined"} and any(key in row for key in ("pv_power_kw", "wind_power_kw", "load_kw")):
                     conn.execute(
-                        "INSERT OR REPLACE INTO energy_forecasts(run_id,point_id,issued_at_utc,target_time_utc,horizon,pv_power_kw,wind_power_kw,load_kw,model_name,quality_score) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (run_id, point_id, issued, row["timestamp"], horizon, row.get("pv_power_kw"), row.get("wind_power_kw"), row.get("load_kw"), model_name, row.get("quality_score", 0.986)),
+                        """INSERT OR REPLACE INTO energy_forecasts
+                        (run_id,point_id,issued_at_utc,target_time_utc,horizon,pv_power_kw,wind_power_kw,load_kw,
+                         pv_available_power_kw,wind_available_power_kw,prediction_basis,model_name,quality_score)
+                        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (run_id, point_id, issued, row["timestamp"], horizon, row.get("pv_power_kw"), row.get("wind_power_kw"), row.get("load_kw"),
+                         row.get("pv_available_power_kw", row.get("pv_power_kw")), row.get("wind_available_power_kw", row.get("wind_power_kw")),
+                         row.get("prediction_basis", "available_power"), model_name, row.get("quality_score", 0.986)),
                     )
         self.finish_run(run_id, "success", len(rows))
         return len(rows)
 
-    def get_forecast_rows(self, point_id: str, horizon: str, limit: int, run_id: str | None = None) -> list[dict[str, object]]:
+    def get_forecast_rows(self, point_id: str, horizon: str, limit: int, run_id: str | None = None, object_id: str | None = None) -> list[dict[str, object]]:
         with self.connection() as conn:
             latest_filter = "l.run_id=?" if run_id else "l.rn=1"
             latest_params: tuple[object, ...] = (run_id,) if run_id else ()
             rows = conn.execute(
                 f"""WITH latest AS (
-                    SELECT run_id, ROW_NUMBER() OVER (ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC) AS rn
+                    SELECT run_id, object_id, ROW_NUMBER() OVER (ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC) AS rn
                     FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
+                    AND (? IS NULL OR object_id=?)
                 )
                 SELECT timestamp,wind_speed_mps,temperature_c,solar_radiation_wm2,
                 pv_power_kw,wind_power_kw,load_kw,source FROM (
@@ -745,14 +965,14 @@ class ForecastDB:
                     JOIN latest l ON l.run_id=e.run_id
                     WHERE e.point_id=? AND e.horizon=? AND w.run_id IS NULL AND {latest_filter}
                 ) ORDER BY timestamp LIMIT ?""",
-                (point_id, horizon, point_id, horizon, *latest_params, point_id, horizon, *latest_params, min(max(int(limit), 1), 2000)),
+                (point_id, horizon, object_id, object_id, point_id, horizon, *latest_params, point_id, horizon, *latest_params, min(max(int(limit), 1), 2000)),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def health(self) -> dict[str, object]:
         with self.connection() as conn:
             tables = {}
-            for table in ("forecast_points", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "nwp_sources", "nwp_forecasts", "forecast_tasks", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations"):
+            for table in ("forecast_points", "forecast_objects", "forecast_runs", "weather_observations", "weather_forecasts", "energy_measurements", "energy_forecasts", "nwp_sources", "nwp_forecasts", "forecast_tasks", "model_registry", "training_runs", "model_updates", "forecast_schedules", "forecast_evaluations", "curtailment_events"):
                 tables[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
         return {"status": "ok", "path": str(self.path), "schema_version": SCHEMA_VERSION, "tables": tables}
 

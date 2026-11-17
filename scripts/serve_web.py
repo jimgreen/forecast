@@ -82,14 +82,22 @@ def load_observation_frame(point_id: str | None) -> pd.DataFrame:
         rows = conn.execute(
             """SELECT COALESCE(w.timestamp_utc,e.timestamp_utc) AS timestamp,
             w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
-            e.pv_power_kw,e.wind_power_kw,e.load_kw
+            COALESCE(e.pv_available_power_kw,e.pv_power_kw) AS pv_power_kw,
+            COALESCE(e.wind_available_power_kw,e.wind_power_kw) AS wind_power_kw,
+            e.load_kw,e.pv_power_kw AS measured_pv_power_kw,e.wind_power_kw AS measured_wind_power_kw,
+            e.pv_available_power_kw,e.wind_available_power_kw,e.pv_curtailment_kw,e.wind_curtailment_kw,
+            e.curtailment_flag,e.curtailment_reason
             FROM weather_observations w LEFT JOIN energy_measurements e
             ON e.point_id=w.point_id AND e.timestamp_utc=w.timestamp_utc
             WHERE w.point_id=?
             UNION ALL
             SELECT e.timestamp_utc AS timestamp,
             w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
-            e.pv_power_kw,e.wind_power_kw,e.load_kw
+            COALESCE(e.pv_available_power_kw,e.pv_power_kw) AS pv_power_kw,
+            COALESCE(e.wind_available_power_kw,e.wind_power_kw) AS wind_power_kw,
+            e.load_kw,e.pv_power_kw AS measured_pv_power_kw,e.wind_power_kw AS measured_wind_power_kw,
+            e.pv_available_power_kw,e.wind_available_power_kw,e.pv_curtailment_kw,e.wind_curtailment_kw,
+            e.curtailment_flag,e.curtailment_reason
             FROM energy_measurements e LEFT JOIN weather_observations w
             ON w.point_id=e.point_id AND w.timestamp_utc=e.timestamp_utc
             WHERE e.point_id=? AND w.point_id IS NULL
@@ -100,7 +108,7 @@ def load_observation_frame(point_id: str | None) -> pd.DataFrame:
         return pd.DataFrame()
     frame = pd.DataFrame([dict(row) for row in rows])
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
-    for column in (*WEATHER_TARGETS, *ENERGY_TARGETS):
+    for column in (*WEATHER_TARGETS, *ENERGY_TARGETS, "measured_pv_power_kw", "measured_wind_power_kw", "pv_available_power_kw", "wind_available_power_kw", "pv_curtailment_kw", "wind_curtailment_kw"):
         frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame.sort_values("timestamp").dropna(subset=[*WEATHER_TARGETS, *ENERGY_TARGETS]).reset_index(drop=True)
 
@@ -124,8 +132,100 @@ def load_weather_observation_frame(point_id: str | None) -> pd.DataFrame:
     return frame.sort_values("timestamp").dropna(subset=list(WEATHER_TARGETS)).reset_index(drop=True)
 
 
+def load_energy_observation_frame(point_id: str | None) -> pd.DataFrame:
+    """Read power history without requiring a weather station row at each time."""
+    if not point_id:
+        return pd.DataFrame()
+    with DB.connection() as conn:
+        rows = conn.execute(
+            """SELECT timestamp_utc AS timestamp,
+               COALESCE(pv_available_power_kw,pv_power_kw) AS pv_power_kw,
+               COALESCE(wind_available_power_kw,wind_power_kw) AS wind_power_kw,
+               load_kw,pv_power_kw AS measured_pv_power_kw,wind_power_kw AS measured_wind_power_kw,
+               pv_available_power_kw,wind_available_power_kw,pv_curtailment_kw,wind_curtailment_kw,
+               curtailment_flag,curtailment_reason,source
+               FROM energy_measurements WHERE point_id=? ORDER BY timestamp_utc""",
+            (point_id,),
+        ).fetchall()
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame([dict(row) for row in rows])
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    for column in (*ENERGY_TARGETS, "measured_pv_power_kw", "measured_wind_power_kw", "pv_available_power_kw", "wind_available_power_kw", "pv_curtailment_kw", "wind_curtailment_kw"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame.sort_values("timestamp").dropna(how="all", subset=list(ENERGY_TARGETS)).reset_index(drop=True)
+
+
+def load_power_training_frame(point_id: str | None) -> pd.DataFrame:
+    """Join real power history to weather history, with a deterministic weather fallback."""
+    power = load_energy_observation_frame(point_id)
+    if power.empty:
+        return power
+    weather = load_weather_observation_frame(point_id)
+    if not weather.empty:
+        result = power.merge(weather[["timestamp", *WEATHER_TARGETS]], on="timestamp", how="left")
+    else:
+        demo = load_demo_frame()[["timestamp", *WEATHER_TARGETS]].copy()
+        demo["timestamp"] = pd.to_datetime(demo["timestamp"], utc=True)
+        result = power.merge(demo, on="timestamp", how="left")
+    for column in WEATHER_TARGETS:
+        if result[column].isna().any():
+            result[column] = result[column].interpolate(limit_direction="both")
+            if result[column].isna().any():
+                result[column] = result[column].fillna(float(load_demo_frame()[column].mean()))
+    return result.dropna(subset=list(WEATHER_TARGETS)).reset_index(drop=True)
+
+
 def point_record(point_id: str) -> dict[str, object] | None:
     return next((point for point in DB.list_points() if point["id"] == point_id), None)
+
+
+def object_record(object_id: str | None, fallback_point_id: str | None = None) -> dict[str, object] | None:
+    if object_id:
+        return DB.resolve_object(object_id)
+    if fallback_point_id:
+        return next((item for item in DB.list_objects() if item["point_id"] == fallback_point_id), None)
+    return None
+
+
+def prepare_power_training_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
+    """Use available power when curtailment metadata proves measured output is clipped."""
+    if frame.empty:
+        return frame, {"curtailment_samples": 0, "adjusted_samples": 0}
+    result = frame.copy()
+    flag = result.get("curtailment_flag", pd.Series(False, index=result.index)).fillna(0).astype(bool)
+    adjusted = 0
+    adjusted_mask = pd.Series(False, index=result.index)
+    for target, available in (("pv_power_kw", "pv_available_power_kw"), ("wind_power_kw", "wind_available_power_kw")):
+        if available in result:
+            available_values = pd.to_numeric(result[available], errors="coerce")
+            use = available_values.notna() & (flag | (available_values > pd.to_numeric(result[target], errors="coerce")))
+            result.loc[use, target] = available_values.loc[use]
+            adjusted += int(use.sum())
+            adjusted_mask = adjusted_mask | use
+    result["curtailment_adjusted"] = flag | adjusted_mask
+    return result, {"curtailment_samples": int(flag.sum()), "adjusted_samples": adjusted}
+
+
+def energy_targets_for(frame: pd.DataFrame, minimum_samples: int = 32) -> tuple[str, ...]:
+    available = tuple(target for target in ENERGY_TARGETS if target in frame and int(frame[target].notna().sum()) >= minimum_samples)
+    return available or ENERGY_TARGETS
+
+
+def curtailment_summary(point_id: str | None = None) -> dict[str, object]:
+    with DB.connection() as conn:
+        where = "WHERE point_id=?" if point_id else ""
+        params = (point_id,) if point_id else ()
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS samples,
+                SUM(curtailment_flag) AS flagged_samples,
+                SUM(COALESCE(pv_curtailment_kw,0)) AS pv_loss_kw,
+                SUM(COALESCE(wind_curtailment_kw,0)) AS wind_loss_kw
+                FROM energy_measurements {where}""", params,
+        ).fetchone()
+    samples = int(row["samples"] or 0)
+    flagged = int(row["flagged_samples"] or 0)
+    return {"samples": samples, "curtailment_samples": flagged, "curtailment_rate": round(flagged / samples * 100, 2) if samples else 0.0, "pv_loss_kw": float(row["pv_loss_kw"] or 0), "wind_loss_kw": float(row["wind_loss_kw"] or 0)}
 
 
 def forecast_anchor(frame: pd.DataFrame) -> pd.Timestamp:
@@ -216,6 +316,15 @@ def point_payload(payload: dict[str, object]) -> dict[str, object]:
     return point
 
 
+def payload_rows(payload: dict[str, object]) -> list[dict[str, object]]:
+    rows = payload.get("rows", [payload])
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError("rows must be an array of objects")
+    return rows
+
+
 def metric_values(actual: pd.Series, predicted: pd.Series) -> dict[str, float | int | None]:
     values = pd.concat([actual, predicted], axis=1).dropna()
     if values.empty:
@@ -232,10 +341,14 @@ def train_model(point_id: str | None, target_kind: str, horizon: str, mode: str,
     model_id = new_id("MDL")
     DB.create_training_run(training_id, point_id, target_kind, horizon, mode, window_size, None)
     try:
-        training_targets = WEATHER_TARGETS if target_kind == "weather" else ENERGY_TARGETS if target_kind == "energy" else (*WEATHER_TARGETS, *ENERGY_TARGETS)
-        frame = load_weather_observation_frame(point_id) if target_kind == "weather" else load_observation_frame(point_id)
+        frame = load_weather_observation_frame(point_id) if target_kind == "weather" else load_power_training_frame(point_id)
+        quality = {"curtailment_samples": 0, "adjusted_samples": 0}
+        if target_kind in {"energy", "combined"}:
+            frame, quality = prepare_power_training_frame(frame)
         if len(frame) < 64:
             frame = load_demo_frame()
+        energy_targets = energy_targets_for(frame)
+        training_targets = WEATHER_TARGETS if target_kind == "weather" else energy_targets if target_kind == "energy" else (*WEATHER_TARGETS, *energy_targets)
         if mode == "rolling":
             frame = frame.tail(min(int(window_size or 672), len(frame))).reset_index(drop=True)
         holdout = min(horizon_count(horizon), max(16, len(frame) // 5))
@@ -249,15 +362,15 @@ def train_model(point_id: str | None, target_kind: str, horizon: str, mode: str,
         prediction = pipeline.predict(len(test_frame), future_weather=test_frame[list(WEATHER_TARGETS)])
         metrics: dict[str, object] = {target: metric_values(test_frame[target], prediction[target]) for target in training_targets}
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
-        artifact = {"model_id": model_id, "model_type": "ridge15min", "target_kind": target_kind, "horizon": horizon, "feature_count": pipeline.model.feature_count if pipeline.model else 0, "coefficients": {key: value.tolist() for key, value in (pipeline.model.coefficients.items() if pipeline.model else [])}}
+        artifact = {"model_id": model_id, "model_type": "ridge15min", "target_kind": target_kind, "horizon": horizon, "feature_count": pipeline.model.feature_count if pipeline.model else 0, "curtailment_policy": "use_available_power_when_flagged", "data_quality": quality, "coefficients": {key: value.tolist() for key, value in (pipeline.model.coefficients.items() if pipeline.model else [])}}
         artifact_path = MODEL_DIR / f"{model_id}.json"
         artifact_path.write_text(json.dumps(artifact, ensure_ascii=False, indent=2), encoding="utf-8")
-        model = {"model_id": model_id, "model_name": "Ridge 15分钟基线", "model_type": "ridge15min", "target_kind": target_kind, "horizon": horizon, "point_id": point_id, "version": now_dt().strftime("v%Y%m%d%H%M%S"), "status": "active", "artifact_path": str(artifact_path), "hyperparams": {"alpha": 1.0, "mode": mode, "window_size": window_size}, "metrics": metrics}
+        model = {"model_id": model_id, "model_name": "Ridge 15分钟基线", "model_type": "ridge15min", "target_kind": target_kind, "horizon": horizon, "point_id": point_id, "version": now_dt().strftime("v%Y%m%d%H%M%S"), "status": "active", "artifact_path": str(artifact_path), "hyperparams": {"alpha": 1.0, "mode": mode, "window_size": window_size, "curtailment_policy": "use_available_power_when_flagged", "data_quality": quality}, "metrics": {**metrics, "data_quality": quality}}
         DB.register_model(model)
         DB.finish_training_run(training_id, "success", model_id, len(train_frame), metrics)
         if mode == "rolling":
             DB.save_model_update({"update_id": new_id("UPD"), "model_id": model_id, "point_id": point_id, "horizon": horizon, "update_strategy": "rolling_window", "window_size": len(frame), "sample_count": len(train_frame), "status": "success", "details": {"training_id": training_id, "metrics": metrics}})
-        return {"training_id": training_id, "model_id": model_id, "status": "success", "sample_count": len(train_frame), "metrics": metrics, "artifact_path": str(artifact_path)}
+        return {"training_id": training_id, "model_id": model_id, "status": "success", "sample_count": len(train_frame), "metrics": {**metrics, "data_quality": quality}, "artifact_path": str(artifact_path), "curtailment_policy": "use_available_power_when_flagged"}
     except Exception as exc:
         DB.finish_training_run(training_id, "failed", model_id, 0, {}, str(exc))
         raise
@@ -276,16 +389,24 @@ def evaluate_run(run_id: str) -> dict[str, object]:
             table = "weather_forecasts" if target in WEATHER_TARGETS else "energy_forecasts"
             actual_table = "weather_observations" if target in WEATHER_TARGETS else "energy_measurements"
             forecast_rows = conn.execute(f"SELECT target_time_utc,{target} AS value FROM {table} WHERE run_id=?", (run_id,)).fetchall()
-            actual_rows = conn.execute(f"SELECT timestamp_utc,{target} AS value FROM {actual_table} WHERE point_id=?", (run["point_id"],)).fetchall()
+            if target == "pv_power_kw":
+                actual_sql = "COALESCE(pv_available_power_kw,pv_power_kw)"
+            elif target == "wind_power_kw":
+                actual_sql = "COALESCE(wind_available_power_kw,wind_power_kw)"
+            else:
+                actual_sql = target
+            flag_sql = "curtailment_flag" if target in ENERGY_TARGETS else "0"
+            actual_rows = conn.execute(f"SELECT timestamp_utc,{actual_sql} AS value,{flag_sql} AS curtailment_flag FROM {actual_table} WHERE point_id=?", (run["point_id"],)).fetchall()
             actual = pd.Series({parse_dt(row["timestamp_utc"]): row["value"] for row in actual_rows}, dtype=float)
             predicted = pd.Series({parse_dt(row["target_time_utc"]): row["value"] for row in forecast_rows}, dtype=float)
             result = metric_values(actual, predicted)
+            result["curtailment_samples"] = int(sum(bool(row["curtailment_flag"]) for row in actual_rows)) if target in {"pv_power_kw", "wind_power_kw"} else 0
             details[target] = result
             paired += int(result["sample_count"] or 0)
         available = [value for value in details.values() if value.get("sample_count", 0)]
         status = "success" if available else "pending"
         aggregate = {key: float(np.mean([float(value[key]) for value in available if value.get(key) is not None])) for key in ("mae", "rmse", "bias", "nmae")} if available else {key: None for key in ("mae", "rmse", "bias", "nmae")}
-        evaluation = {"evaluation_id": new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details}
+        evaluation = {"evaluation_id": new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details, "evaluation_basis": "available_power_for_curtailment"}
     DB.save_evaluation(evaluation)
     return evaluation
 
@@ -301,13 +422,14 @@ def execute_run(run_id: str, point_id: str, kind: str, horizon: str) -> dict[str
             predictions = IntegratedForecastPipeline().fit(history_indexed, targets=WEATHER_TARGETS).predict(horizon, future_weather=future_weather)
             rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "source": "NWP + 本地微气象校正"} for index, row in predictions.iterrows()]
         else:
-            history = load_observation_frame(point_id)
+            history = load_power_training_frame(point_id)
             source_history = history if len(history) >= 64 else load_demo_frame()
             history_indexed = source_history.set_index("timestamp")
             anchor_source = history if not history.empty else local_weather
             future_index = make_future_index(forecast_anchor(anchor_source), horizon)
             future_weather = fused_future_weather(point_id, horizon, future_index, local=local_weather)
-            targets = ENERGY_TARGETS if kind == "energy" else (*WEATHER_TARGETS, *ENERGY_TARGETS)
+            energy_targets = energy_targets_for(source_history)
+            targets = energy_targets if kind == "energy" else (*WEATHER_TARGETS, *energy_targets)
             predictions = IntegratedForecastPipeline().fit(history_indexed, targets=targets).predict(horizon, future_weather=future_weather)
             rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "source": "NWP + 本地微气象校正"} for index, row in predictions.iterrows()]
         written = DB.save_forecast_rows(run_id, point_id, horizon, rows, kind, "Ridge 15分钟基线", "NWP + 本地校正")
@@ -323,10 +445,17 @@ def next_schedule_at(schedule: dict[str, object]) -> str:
 
 def run_schedule(schedule: dict[str, object]) -> list[str]:
     run_ids = []
-    for point_id in schedule.get("point_ids", []):
+    targets = []
+    for object_id in schedule.get("object_ids", []):
+        obj = DB.resolve_object(str(object_id))
+        if obj:
+            targets.append((str(obj["point_id"]), str(obj["object_id"])))
+    if not targets:
+        targets = [(str(point_id), str(point_id)) for point_id in schedule.get("point_ids", [])]
+    for point_id, object_id in targets:
         run_id = new_id("FC")
-        DB.create_run(run_id, str(point_id), schedule["forecast_kind"], schedule["horizon"], "scheduled")
-        execute_run(run_id, str(point_id), schedule["forecast_kind"], schedule["horizon"])
+        DB.create_run(run_id, point_id, schedule["forecast_kind"], schedule["horizon"], "scheduled", object_id=object_id)
+        execute_run(run_id, point_id, schedule["forecast_kind"], schedule["horizon"])
         run_ids.append(run_id)
     if run_ids:
         DB.mark_schedule_run(schedule["schedule_id"], run_ids[-1], next_schedule_at(schedule))
@@ -401,11 +530,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({**DB.health(), "time": now_iso(), "scheduler": "enabled"})
             elif parsed.path == "/api/points":
                 self.json_response({"points": DB.list_points()})
+            elif parsed.path == "/api/objects":
+                self.json_response({"objects": DB.list_objects(enabled_only=False)})
             elif parsed.path in {"/api/forecast", "/api/curves"}:
                 point_id = query.get("point_id", ["P001"])[0]; horizon = query.get("horizon", ["day_ahead"])[0]
                 if horizon not in HORIZONS: raise ValueError("unsupported horizon")
+                object_id = query.get("object_id", [None])[0]
+                if object_id:
+                    obj = DB.resolve_object(object_id)
+                    if not obj: raise ValueError("unknown object_id")
+                    point_id = str(obj["point_id"])
                 run_id = query.get("run_id", [None])[0]
-                self.json_response({"point_id": point_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, horizon_count(horizon), run_id)})
+                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, horizon_count(horizon), run_id, object_id)})
             elif parsed.path == "/api/runs":
                 self.json_response({"runs": DB.list_runs(min(max(int(query.get("limit", [50])[0]), 1), 200), query.get("status", [None])[0], query.get("point_id", [None])[0])})
             elif parsed.path == "/api/models":
@@ -422,6 +558,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({"tasks": DB.list_tasks(query.get("point_id", [None])[0])})
             elif parsed.path == "/api/observation-summary":
                 self.json_response({"stations": observation_summary(query.get("point_id", [None])[0])})
+            elif parsed.path == "/api/curtailment-summary":
+                self.json_response(curtailment_summary(query.get("point_id", [None])[0]))
             elif parsed.path == "/api/status":
                 health = DB.health()
                 self.json_response({"health": health, "latest_run": DB.list_runs(1)[0] if DB.list_runs(1) else None, "active_models": len([m for m in DB.list_models() if m["status"] == "active"]), "schedules": len([s for s in DB.list_schedules() if s["enabled"]])})
@@ -435,6 +573,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response({"forecasts": DB.list_nwp_forecasts(query.get("point_id", [None])[0], query.get("horizon", [None])[0], query.get("limit", [672])[0])})
             elif parsed.path == "/api/energy-measurements":
                 self.json_response({"measurements": DB.list_energy_measurements(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
+            elif parsed.path == "/api/curtailment-events":
+                self.json_response({"events": DB.list_curtailment_events(query.get("point_id", [None])[0], query.get("limit", [100])[0])})
             else:
                 self.serve_static(parsed.path)
         except (ValueError, KeyError) as exc:
@@ -449,7 +589,17 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/run":
                 horizon = str(payload.get("horizon", "day_ahead")); kind = str(payload.get("kind", "combined")); trigger = str(payload.get("trigger", "manual"))
                 if horizon not in HORIZONS or kind not in KINDS or trigger not in TRIGGERS: raise ValueError("invalid run parameters")
-                point_ids = payload.get("point_ids") or [payload.get("point_id", "P001")]
+                object_ids = payload.get("object_ids") or ([payload.get("object_id")] if payload.get("object_id") else [])
+                resolved_objects = []
+                if object_ids:
+                    for object_id in object_ids:
+                        obj = DB.resolve_object(str(object_id))
+                        if not obj: raise ValueError(f"unknown object_id: {object_id}")
+                        if not obj["enabled"]: raise ValueError(f"disabled object_id: {object_id}")
+                        resolved_objects.append(obj)
+                    point_ids = [str(obj["point_id"]) for obj in resolved_objects]
+                else:
+                    point_ids = payload.get("point_ids") or [payload.get("point_id", "P001")]
                 if not isinstance(point_ids, list) or not point_ids: raise ValueError("point_ids must contain at least one point")
                 known_points = {point["id"]: point for point in DB.list_points()}
                 unknown = [str(point_id) for point_id in point_ids if str(point_id) not in known_points]
@@ -462,19 +612,33 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     scheduled_at = None
                 run_results = []
-                for point_id in point_ids:
-                    run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, scheduled_at)
+                for index, point_id in enumerate(point_ids):
+                    object_id = resolved_objects[index]["object_id"] if resolved_objects else str(point_id)
+                    run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, scheduled_at, object_id)
                     if scheduled_at and parse_dt(scheduled_at) > now_dt():
-                        run_results.append({"run_id": run_id, "status": "accepted"})
+                        run_results.append({"run_id": run_id, "object_id": object_id, "status": "accepted"})
                     else:
-                        run_results.append(execute_run(run_id, str(point_id), kind, horizon))
-                self.json_response({"run_id": run_results[0]["run_id"], "run_ids": [item["run_id"] for item in run_results], "status": run_results[-1]["status"], "results": run_results, "received": payload, "created_at": now_iso()})
+                        result = execute_run(run_id, str(point_id), kind, horizon)
+                        result["object_id"] = object_id
+                        run_results.append(result)
+                self.json_response({"run_id": run_results[0]["run_id"], "run_ids": [item["run_id"] for item in run_results], "object_ids": [item.get("object_id") for item in run_results], "status": run_results[-1]["status"], "results": run_results, "received": payload, "created_at": now_iso()})
             elif parsed.path in {"/api/train", "/api/training"}:
-                point_ids = payload.get("point_ids") or [payload.get("point_id")]
+                object_ids = payload.get("object_ids") or ([payload.get("object_id")] if payload.get("object_id") else [])
+                if object_ids:
+                    resolved = [DB.resolve_object(str(object_id)) for object_id in object_ids]
+                    if any(item is None for item in resolved): raise ValueError("unknown object_id")
+                    point_ids = [item["point_id"] for item in resolved if item]
+                else:
+                    point_ids = payload.get("point_ids") or [payload.get("point_id")]
                 results = [train_model(str(point_id) if point_id else None, str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), str(payload.get("mode", "offline")), int(payload["window_size"]) if payload.get("window_size") else None) for point_id in point_ids]
                 self.json_response({"status": "success", "results": results})
             elif parsed.path == "/api/model-update":
-                result = train_model(payload.get("point_id"), str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), "rolling", int(payload.get("window_size", 672)))
+                point_id = payload.get("point_id")
+                if payload.get("object_id"):
+                    obj = DB.resolve_object(str(payload["object_id"]))
+                    if not obj: raise ValueError("unknown object_id")
+                    point_id = obj["point_id"]
+                result = train_model(point_id, str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), "rolling", int(payload.get("window_size", 672)))
                 self.json_response(result)
             elif parsed.path == "/api/evaluate":
                 self.json_response(evaluate_run(str(payload["run_id"])))
@@ -488,12 +652,19 @@ class Handler(BaseHTTPRequestHandler):
                 DB.save_settings(payload); self.json_response({"status": "saved", "settings": DB.get_settings()})
             elif parsed.path == "/api/points":
                 point = point_payload(payload); DB.upsert_point(point); self.json_response({"status": "saved", "point": next(item for item in DB.list_points() if item["id"] == point["id"])})
+            elif parsed.path == "/api/objects":
+                obj = dict(payload)
+                if not obj.get("object_id") or not obj.get("point_id"): raise ValueError("object_id and point_id are required")
+                DB.upsert_object(obj)
+                self.json_response({"status": "saved", "object": DB.resolve_object(str(obj["object_id"]))})
             elif parsed.path == "/api/weather-observations":
-                rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_weather_observations(rows)})
+                self.json_response({"status": "saved", "rows_written": DB.save_weather_observations(payload_rows(payload))})
             elif parsed.path == "/api/nwp-forecasts":
-                rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_nwp_forecasts(rows)})
+                self.json_response({"status": "saved", "rows_written": DB.save_nwp_forecasts(payload_rows(payload))})
             elif parsed.path == "/api/energy-measurements":
-                rows = payload.get("rows", [payload]); self.json_response({"status": "saved", "rows_written": DB.save_energy_measurements(rows)})
+                self.json_response({"status": "saved", "rows_written": DB.save_energy_measurements(payload_rows(payload))})
+            elif parsed.path == "/api/curtailment-events":
+                self.json_response({"status": "saved", "rows_written": DB.save_curtailment_events(payload_rows(payload))})
             else:
                 self.json_response({"error": "not found"}, 404)
         except (ValueError, KeyError) as exc:
