@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>新能源预测调度中心 · point-config</title>
+  <meta name="description" content="天气、新能源出力与负荷预测一体化人机界面">
+  <link rel="stylesheet" href="/web/styles.css">
+  <script defer src="/web/app.js"></script>
+  <script defer src="/web/analysis.js"></script>
+  <script defer src="/web/query.js"></script>
+</head>
+<body data-page="point-config">
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="功能导航">
+      <div class="brand">
+        <div class="brand-mark">▥</div>
+        <div><strong>预测调度中心</strong><span>FORECAST OPS</span></div>
+      </div>
+      <div class="site-select"><span class="status-dot"></span><span>南岛综合能源站</span><span class="chevron">⌄</span></div>
+      <nav class="nav-tree" id="navTree">
+        <div class="nav-caption">运行中心</div>
+        <a class="nav-item" data-view="dashboard" href="/web/index.html"><span class="nav-icon">⌂</span>主画面</a>
+        <a class="nav-item" data-view="run-status" href="/web/run-status.html"><span class="nav-icon">◷</span>运行状态</a>
+
+        <div class="nav-caption">预测点管理</div>
+        <a class="nav-item" data-view="points" href="/web/points.html"><span class="nav-icon">⌁</span>预测点列表</a>
+        <a class="nav-item active" data-view="point-config" href="/web/point-config.html"><span class="nav-icon">⚙</span>点参数配置</a>
+
+        <div class="nav-caption">数据查询</div>
+        <a class="nav-item" data-view="weather-dashboard" href="/web/weather-dashboard.html"><span class="nav-icon">✦</span>气象预测总览</a>
+        <a class="nav-item" data-view="weather-input" href="/web/weather-input.html"><span class="nav-icon">☁</span>天气输入曲线</a>
+        <a class="nav-item" data-view="weather-results" href="/web/weather-results.html"><span class="nav-icon">⌁</span>气象预测结果</a>
+        <a class="nav-item" data-view="weather-evaluation" href="/web/weather-evaluation.html"><span class="nav-icon">▥</span>气象误差评估</a>
+        <a class="nav-item" data-view="energy-input" href="/web/energy-input.html"><span class="nav-icon">◒</span>能源输入曲线</a>
+        <a class="nav-item" data-view="results" href="/web/results.html"><span class="nav-icon">↗</span>预测结果</a>
+
+        <div class="nav-caption">气象预测</div>
+        <a class="nav-item" data-view="meteo-observations" href="/web/meteo-observations.html"><span class="nav-icon">⌖</span>本地观测管理</a>
+        <a class="nav-item" data-view="nwp-config" href="/web/nwp-config.html"><span class="nav-icon">◫</span>NWP资料配置</a>
+        <a class="nav-item" data-view="weather-run" href="/web/weather-run.html"><span class="nav-icon">▶</span>气象预测运行</a>
+
+        <div class="nav-caption">预测任务</div>
+        <a class="nav-item" data-view="task-config" href="/web/task-config.html"><span class="nav-icon">▤</span>任务配置</a>
+        <a class="nav-item" data-view="manual-run" href="/web/manual-run.html"><span class="nav-icon">▶</span>人工启动</a>
+         <a class="nav-item" data-view="auto-schedule" href="/web/auto-schedule.html"><span class="nav-icon">⟳</span>自动定时预测</a>
+         <a class="nav-item" data-view="model-training" href="/web/model-training.html"><span class="nav-icon">⌘</span>模型离线训练</a>
+         <a class="nav-item" data-view="model-update" href="/web/model-update.html"><span class="nav-icon">↻</span>模型滚动更新</a>
+        <a class="nav-item" data-view="history" href="/web/history.html"><span class="nav-icon">◴</span>历史运行</a>
+         <a class="nav-item" data-view="evaluation" href="/web/evaluation.html"><span class="nav-icon">▥</span>结果后评估</a>
+
+        <div class="nav-caption">系统设置</div>
+        <a class="nav-item" data-view="system-settings" href="/web/system-settings.html"><span class="nav-icon">◌</span>数据源与模型</a>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-chip"><div class="avatar">WB</div><div><b>值班工程师</b><span>运行权限 · 已登录</span></div><span class="more">⋯</span></div>
+        <div class="version">Forecast HMI · v0.1.0</div>
+      </div>
+    </aside>
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumb"><span id="breadcrumbRoot">运行中心</span><b>/</b><strong id="breadcrumbLeaf">主画面</strong></div>
+        <div class="top-actions"><span class="last-sync">数据同步 <b id="lastSync">刚刚</b></span><button class="icon-button" id="refreshBtn" title="刷新">↻</button><button class="icon-button" title="通知">♢<i class="notification-dot"></i></button><div class="top-avatar">WB</div></div>
+      </header>
+      <div class="content" id="content"><section class="view" data-page="point-config"><div class="page-heading"><div><p class="eyebrow">预测点管理 · CONFIGURATION</p><h1>点参数配置</h1><p class="muted">维护坐标、容量、预测对象、时间粒度和模型策略。</p></div><span class="save-state" id="pointSaveState">配置自动保存</span></div><div class="config-layout"><article class="panel point-list-panel"><div class="panel-header"><div><h2>预测点</h2><p>选择需要编辑的点</p></div></div><div id="configPointList" class="config-point-list"></div></article><article class="panel form-panel"><div class="panel-header"><div><h2 id="configTitle">编辑预测点</h2><p>参数变化会应用于下一次任务</p></div><span class="config-status" id="configStatus">启用</span></div><form id="pointForm" class="config-form"><input type="hidden" id="formPointId"><label>预测点名称<input id="formPointName" required></label><div class="two-col"><label>纬度<input id="formLat" type="number" step="0.0001"></label><label>经度<input id="formLon" type="number" step="0.0001"></label></div><div class="two-col"><label>光伏容量 (kW)<input id="formPv" type="number" min="0"></label><label>风电容量 (kW)<input id="formWind" type="number" min="0"></label></div><label>预测对象<div class="check-row"><label><input id="formPvEnabled" type="checkbox"> 光伏</label><label><input id="formWindEnabled" type="checkbox"> 风电</label><label><input id="formLoadEnabled" type="checkbox"> 负荷</label></div></label><label>模型策略<select id="formModel"><option>Ridge 15分钟基线</option><option>OpenSTEF 概率预测</option><option>Quartz 光伏模型</option><option>Transformer 负荷模型</option></select></label><label>数据源<select id="formSource"><option>本地采集 + Open-Meteo</option><option>本地采集 + NOAA NWP</option><option>本地采集 + ECMWF</option></select></label><div class="form-actions"><button type="button" class="secondary-button" id="disablePointBtn">停用预测点</button><button type="submit" class="primary-button">保存配置</button></div></form></article></div></section></div>
+    </main>
+  </div>
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <div class="modal-backdrop" id="modalBackdrop" hidden><div class="modal"><button class="modal-close" id="modalClose">×</button><h2 id="modalTitle">新增预测点</h2><p>填写基本信息后保存到本地配置。</p><form id="modalForm" class="config-form"><label>预测点名称<input id="modalName" required placeholder="如：东侧光伏站"></label><div class="two-col"><label>纬度<input id="modalLat" type="number" step="0.0001" value="-36.85"></label><label>经度<input id="modalLon" type="number" step="0.0001" value="174.76"></label></div><div class="two-col"><label>光伏容量 (kW)<input id="modalPv" type="number" min="0" value="100"></label><label>风电容量 (kW)<input id="modalWind" type="number" min="0" value="0"></label></div><div class="form-actions"><button type="button" class="secondary-button" id="modalCancel">取消</button><button type="submit" class="primary-button">保存</button></div></form></div></div>
+</body>
+</html>

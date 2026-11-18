@@ -24,6 +24,10 @@ async function queryPage(kind) {
   const point=kind==='results'?objectById(objectId)?.point_id||state.selectedPoint:$('.query-point',view)?.value||state.selectedPoint;
   const horizon=def.horizon?$(def.horizon).value:null, metric=$(def.metric).value;
   let pin=pinnedRuns.get(def.page);
+  if(!pin){
+    const runId=typeof location!=='undefined'?new URLSearchParams(location.search).get('run_id'):null;
+    if(runId)pin={run_id:runId};
+  }
   if(pin && (pin.point_id!==point || pin.horizon!==horizon || (kind==='results'&&pin.object_id!==objectId))){
     pinnedRuns.delete(def.page);pin=null;
   }
@@ -73,26 +77,14 @@ async function queryPage(kind) {
     renderQueryAnalytics(kind,snapshot);
   }
   const latest=$('[data-latest-results]',view);
-  if(latest)latest.hidden=!pinnedRuns.has(def.page);
+  if(latest)latest.hidden=!pinnedRuns.has(def.page)&&!(typeof location!=='undefined'&&new URLSearchParams(location.search).has('run_id'));
 }
 
 function openRunResults(run) {
   if(run.status!=='success'){toast(run.error_message||'该运行尚无成功结果',true);return}
   const weather=run.forecast_kind==='weather', page=weather?'weather-results':'results';
   state.selectedPoint=run.point_id;
-  if(weather){
-    $('.view[data-page="weather-results"] .query-point').value=run.point_id;
-    $('#weatherResultHorizon').value=run.horizon;
-  }else{
-    const select=$('#resultObject');
-    if(![...select.options].some(option=>option.value===run.object_id)){
-      select.add(new Option('历史点位 · '+run.object_id,run.object_id));
-    }
-    select.value=run.object_id;
-    $('#resultHorizon').value=run.horizon;
-  }
-  pinnedRuns.set(page,run);
-  setView(page);
+  window.location.href=`${pageUrls[page]||'index.html'}?run_id=${encodeURIComponent(run.run_id)}`;
 }
 
 // Page all rows inside the available panel space. Only one slice is visible;
@@ -137,6 +129,7 @@ document.addEventListener('DOMContentLoaded',()=>{
   });
   for(const [kind,def] of Object.entries(queryDefinitions)){
     const view=$('.view[data-page="'+def.page+'"]');
+    if(!view)continue;
     if(def.horizon){
       const button=document.createElement('button');
       button.type='button';button.className='text-button';button.textContent='返回最新结果';button.dataset.latestResults='';button.hidden=true;
