@@ -94,6 +94,8 @@ python scripts\init_forecast_db.py
 - `POST /api/model-update`：按选定对象的最近窗口执行滚动更新，登记 `model_updates` 更新记录，并保留对象级模型版本。
 - `POST /api/run`：人工启动或指定未来启动时刻；支持 `object_id/object_ids` 选择全网、场站或单机对象，也兼容 `point_id/point_ids`；支持小时前、超短期、日前和周前周期。多对象立即任务使用有界并行执行，减少等待时间；任务会生成预测、写入 `forecast_runs` 并创建后评估记录。
 - `GET /api/forecast`：支持 `object_id`、`run_id`、`horizon` 和 `limit` 查询参数，可按对象和结果条数快速查询最新预测。
+- `GET /api/runs`：支持 `status`、`point_id`、`object_id`、`horizon` 和 `limit` 筛选运行记录；`POST /api/run/retry` 可重试失败任务。
+- `POST /api/evaluate-pending`：批量刷新待实测评估；同一运行会复用最新评估记录，避免重复计数。
 - `GET/POST /api/schedules`：配置自动定时预测；服务内置调度线程按 `next_run_at` 和 `cadence_minutes` 执行任务。
 - `GET /api/evaluations`、`POST /api/evaluate`：将预测与同点位实测值按 15 分钟时间戳对齐，计算 MAE、RMSE、BIAS 和 nMAE；实际值尚未到达时记录为 `pending`，补齐后可再次评估。
 

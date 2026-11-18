@@ -47,10 +47,11 @@ def test_model_schedule_and_evaluation_roundtrip(tmp_path):
     db.create_run("TEST-1", "P001", "combined", "day_ahead")
     db.upsert_schedule({"schedule_id": "SCH-1", "name": "日前", "point_ids": ["P001"], "forecast_kind": "combined", "horizon": "day_ahead", "cadence_minutes": 1440, "next_run_at": "2026-01-01T00:00:00Z"})
     db.save_evaluation({"evaluation_id": "EVA-1", "run_id": "TEST-1", "point_id": "P001", "forecast_kind": "combined", "horizon": "day_ahead", "sample_count": 0, "status": "pending"})
+    db.save_evaluation({"evaluation_id": "EVA-1", "run_id": "TEST-1", "point_id": "P001", "forecast_kind": "combined", "horizon": "day_ahead", "sample_count": 4, "status": "success", "mae": 1.0})
     assert db.list_models()[0]["model_id"] == "MDL-1"
     assert db.list_training_runs()[0]["status"] == "success"
     assert db.list_schedules()[0]["schedule_id"] == "SCH-1"
-    assert db.list_evaluations()[0]["status"] == "pending"
+    assert db.list_evaluations()[0]["status"] == "success"
 
 
 def test_hour_weather_and_nwp_cache_roundtrip(tmp_path):
@@ -127,3 +128,13 @@ def test_model_records_keep_object_scope(tmp_path):
     assert db.list_models(object_id="OBJ-WIND-P002-U01")[0]["object_id"] == "OBJ-WIND-P002-U01"
     assert db.list_training_runs()[0]["object_id"] == "OBJ-WIND-P002-U01"
     assert db.list_model_updates()[0]["object_id"] == "OBJ-WIND-P002-U01"
+
+
+def test_run_filters_keep_horizon_and_object_scope(tmp_path):
+    db = ForecastDB(tmp_path / "forecast.db")
+    db.initialize()
+    db.seed_defaults()
+    db.create_run("RUN-HOUR", "P002", "energy", "hour_ahead", object_id="OBJ-WIND-P002-U01")
+    db.create_run("RUN-DAY", "P002", "energy", "day_ahead", object_id="OBJ-WIND-P002")
+    assert [row["run_id"] for row in db.list_runs(horizon="hour_ahead")] == ["RUN-HOUR"]
+    assert [row["run_id"] for row in db.list_runs(object_id="OBJ-WIND-P002")] == ["RUN-DAY"]

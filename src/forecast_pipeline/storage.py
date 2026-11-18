@@ -621,7 +621,14 @@ class ForecastDB:
         with self.connection() as conn:
             conn.execute("UPDATE forecast_runs SET status=?, finished_at=?, rows_written=?, error_message=? WHERE run_id=?", (status, utc_now(), rows_written, error_message, run_id))
 
-    def list_runs(self, limit: int = 50, status: str | None = None, point_id: str | None = None) -> list[dict[str, object]]:
+    def list_runs(
+        self,
+        limit: int = 50,
+        status: str | None = None,
+        point_id: str | None = None,
+        horizon: str | None = None,
+        object_id: str | None = None,
+    ) -> list[dict[str, object]]:
         with self.connection() as conn:
             clauses = []
             params: list[object] = []
@@ -629,6 +636,10 @@ class ForecastDB:
                 clauses.append("status=?"); params.append(status)
             if point_id:
                 clauses.append("point_id=?"); params.append(point_id)
+            if horizon:
+                clauses.append("horizon=?"); params.append(horizon)
+            if object_id:
+                clauses.append("object_id=?"); params.append(object_id)
             where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
             rows = conn.execute(f"SELECT * FROM forecast_runs{where} ORDER BY started_at DESC LIMIT ?", (*params, min(max(int(limit), 1), 200))).fetchall()
         return [dict(r) for r in rows]
@@ -826,7 +837,7 @@ class ForecastDB:
     def save_evaluation(self, evaluation: Mapping[str, object]) -> None:
         with self.connection() as conn:
             conn.execute(
-                """INSERT INTO forecast_evaluations(evaluation_id,run_id,point_id,forecast_kind,horizon,window_start,window_end,sample_count,status,mae,rmse,bias,nmae,coverage,metrics_json,evaluated_at)
+                """INSERT OR REPLACE INTO forecast_evaluations(evaluation_id,run_id,point_id,forecast_kind,horizon,window_start,window_end,sample_count,status,mae,rmse,bias,nmae,coverage,metrics_json,evaluated_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (evaluation["evaluation_id"], evaluation["run_id"], evaluation.get("point_id"), evaluation["forecast_kind"], evaluation["horizon"], evaluation.get("window_start"), evaluation.get("window_end"), evaluation.get("sample_count", 0), evaluation.get("status", "pending"), evaluation.get("mae"), evaluation.get("rmse"), evaluation.get("bias"), evaluation.get("nmae"), evaluation.get("coverage"), json.dumps(evaluation.get("metrics", {}), ensure_ascii=False), evaluation.get("evaluated_at", utc_now())),
             )

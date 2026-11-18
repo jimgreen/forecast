@@ -456,6 +456,7 @@ def train_model(point_id: str | None, target_kind: str, horizon: str, mode: str,
 def evaluate_run(run_id: str) -> dict[str, object]:
     with DB.connection() as conn:
         run = conn.execute("SELECT * FROM forecast_runs WHERE run_id=?", (run_id,)).fetchone()
+        previous = conn.execute("SELECT evaluation_id FROM forecast_evaluations WHERE run_id=? ORDER BY evaluated_at DESC LIMIT 1", (run_id,)).fetchone()
         if run is None:
             raise ValueError("run not found")
         forecast_kind = run["forecast_kind"]
@@ -484,7 +485,7 @@ def evaluate_run(run_id: str) -> dict[str, object]:
         available = [value for value in details.values() if value.get("sample_count", 0)]
         status = "success" if available else "pending"
         aggregate = {key: float(np.mean([float(value[key]) for value in available if value.get(key) is not None])) for key in ("mae", "rmse", "bias", "nmae")} if available else {key: None for key in ("mae", "rmse", "bias", "nmae")}
-        evaluation = {"evaluation_id": new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details, "evaluation_basis": "available_power_for_curtailment"}
+        evaluation = {"evaluation_id": previous["evaluation_id"] if previous else new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details, "evaluation_basis": "available_power_for_curtailment"}
     DB.save_evaluation(evaluation)
     return evaluation
 
@@ -543,6 +544,40 @@ def run_schedule(schedule: dict[str, object]) -> list[str]:
     if run_ids:
         DB.mark_schedule_run(schedule["schedule_id"], run_ids[-1], next_schedule_at(schedule))
     return run_ids
+
+
+def retry_run(run_id: str) -> dict[str, object]:
+    """Re-run a failed forecast with the same object, kind and horizon."""
+    with DB.connection() as conn:
+        source = conn.execute("SELECT * FROM forecast_runs WHERE run_id=?", (run_id,)).fetchone()
+    if source is None:
+        raise ValueError("run not found")
+    if source["status"] != "failed":
+        raise ValueError("only failed runs can be retried")
+    object_id = str(source["object_id"] or source["point_id"])
+    new_run_id = new_id("FC")
+    DB.create_run(new_run_id, str(source["point_id"]), str(source["forecast_kind"]), str(source["horizon"]), "manual", object_id=object_id)
+    result = execute_run(new_run_id, str(source["point_id"]), str(source["forecast_kind"]), str(source["horizon"]))
+    result.update({"retry_of": run_id, "object_id": object_id})
+    return result
+
+
+def evaluate_pending(limit: int = 200) -> dict[str, object]:
+    """Refresh pending evaluations after new observations have arrived."""
+    pending = [item for item in DB.list_evaluations(limit=min(max(int(limit), 1), 500)) if item["status"] == "pending"]
+    results: list[dict[str, object]] = []
+    for item in pending:
+        try:
+            results.append(evaluate_run(str(item["run_id"])))
+        except Exception as exc:
+            results.append({"run_id": item["run_id"], "status": "failed", "error": str(exc)})
+    return {
+        "requested": len(pending),
+        "completed": sum(1 for item in results if item.get("status") == "success"),
+        "pending": sum(1 for item in results if item.get("status") == "pending"),
+        "failed": sum(1 for item in results if item.get("status") == "failed"),
+        "results": results,
+    }
 
 
 def observation_summary(point_id: str | None = None) -> list[dict[str, object]]:
@@ -627,7 +662,13 @@ class Handler(BaseHTTPRequestHandler):
                 requested_limit = min(max(int(query.get("limit", [horizon_count(horizon)])[0]), 1), 2000)
                 self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id)})
             elif parsed.path == "/api/runs":
-                self.json_response({"runs": DB.list_runs(min(max(int(query.get("limit", [50])[0]), 1), 200), query.get("status", [None])[0], query.get("point_id", [None])[0])})
+                self.json_response({"runs": DB.list_runs(
+                    min(max(int(query.get("limit", [50])[0]), 1), 200),
+                    query.get("status", [None])[0],
+                    query.get("point_id", [None])[0],
+                    query.get("horizon", [None])[0],
+                    query.get("object_id", [None])[0],
+                )})
             elif parsed.path == "/api/models":
                 self.json_response({"models": DB.list_models(query.get("point_id", [None])[0], query.get("horizon", [None])[0], query.get("object_id", [None])[0])})
             elif parsed.path in {"/api/training-runs", "/api/trainings"}:
@@ -673,7 +714,11 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path); payload = self.read_json()
         if payload is None: return
         try:
-            if parsed.path == "/api/run":
+            if parsed.path == "/api/run/retry":
+                self.json_response(retry_run(str(payload["run_id"])))
+            elif parsed.path == "/api/evaluate-pending":
+                self.json_response(evaluate_pending(int(payload.get("limit", 200))))
+            elif parsed.path == "/api/run":
                 horizon = str(payload.get("horizon", "day_ahead")); kind = str(payload.get("kind", "combined")); trigger = str(payload.get("trigger", "manual"))
                 if horizon not in HORIZONS or kind not in KINDS or trigger not in TRIGGERS: raise ValueError("invalid run parameters")
                 object_ids = payload.get("object_ids") or ([payload.get("object_id")] if payload.get("object_id") else [])
