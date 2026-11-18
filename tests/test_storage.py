@@ -105,3 +105,25 @@ def test_object_scope_and_curtailment_roundtrip(tmp_path):
     }], kind="energy")
     assert db.list_runs(1)[0]["object_id"] == "OBJ-GRID"
     assert db.get_forecast_rows("P001", "hour_ahead", 4, object_id="OBJ-GRID")[0]["pv_power_kw"] == 80.0
+
+
+def test_model_records_keep_object_scope(tmp_path):
+    db = ForecastDB(tmp_path / "forecast.db")
+    db.initialize()
+    db.seed_defaults()
+    db.register_model({
+        "model_id": "MDL-OBJECT",
+        "model_name": "混合特征 Ridge",
+        "model_type": "hybrid_ridge15min",
+        "target_kind": "energy",
+        "horizon": "hour_ahead",
+        "point_id": "P002",
+        "object_id": "OBJ-WIND-P002-U01",
+        "version": "v-object",
+        "metrics": {"wind_power_kw": {"mae": 0.5}},
+    })
+    db.create_training_run("TRN-OBJECT", "P002", "energy", "hour_ahead", "offline", 64, object_id="OBJ-WIND-P002-U01")
+    db.save_model_update({"update_id": "UPD-OBJECT", "model_id": "MDL-OBJECT", "point_id": "P002", "object_id": "OBJ-WIND-P002-U01", "horizon": "hour_ahead", "window_size": 64})
+    assert db.list_models(object_id="OBJ-WIND-P002-U01")[0]["object_id"] == "OBJ-WIND-P002-U01"
+    assert db.list_training_runs()[0]["object_id"] == "OBJ-WIND-P002-U01"
+    assert db.list_model_updates()[0]["object_id"] == "OBJ-WIND-P002-U01"

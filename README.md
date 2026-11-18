@@ -90,8 +90,8 @@ python scripts\init_forecast_db.py
 
 模型和任务闭环还包括：
 
-- `POST /api/train`：离线训练 Ridge 15 分钟基线，保存模型版本、系数文件、训练样本数和验证指标。
-- `POST /api/model-update`：按最近窗口执行滚动更新，登记 `model_updates` 更新记录。
+- `POST /api/train`：按 `object_id/object_ids` 对全网、场站或单机训练模型；默认使用混合特征 Ridge（天气、15 分钟周期、周周期、滞后值和滚动统计量），并保存模型版本、容量边界、系数文件、训练样本数和验证指标。`strategy=ridge_baseline` 可切回简化基线。
+- `POST /api/model-update`：按选定对象的最近窗口执行滚动更新，登记 `model_updates` 更新记录，并保留对象级模型版本。
 - `POST /api/run`：人工启动或指定未来启动时刻；支持 `object_id/object_ids` 选择全网、场站或单机对象，也兼容 `point_id/point_ids`；支持小时前、超短期、日前和周前周期，立即任务会生成预测、写入 `forecast_runs` 并创建后评估记录。
 - `GET/POST /api/schedules`：配置自动定时预测；服务内置调度线程按 `next_run_at` 和 `cadence_minutes` 执行任务。
 - `GET /api/evaluations`、`POST /api/evaluate`：将预测与同点位实测值按 15 分钟时间戳对齐，计算 MAE、RMSE、BIAS 和 nMAE；实际值尚未到达时记录为 `pending`，补齐后可再次评估。
@@ -105,7 +105,7 @@ python scripts\train_model.py --point P001 --kind combined --horizon day_ahead
 python scripts\train_model.py --point P001 --kind energy --mode rolling --window-size 672
 ```
 
-当本地观测表已有不少于 64 个完整的 15 分钟历史样本时，训练和运行任务优先使用 SQLite 中的真实观测；样本不足时使用 `demo_week_ahead_forecast.csv` 作为可审计的离线兜底。带有可发功率或弃电标记的历史记录会在训练前替换被限发污染的实际出力，避免模型学习到调度限制造成的低功率。接入生产采集后，可通过 `/api/weather-observations` 和 `/api/energy-measurements` 持续写入历史/实时数据，训练、滚动更新和后评估会自动切换到真实数据。
+当本地观测表已有不少于 64 个完整的 15 分钟历史样本时，训练和运行任务优先使用 SQLite 中的真实观测；样本不足时使用 `demo_week_ahead_forecast.csv` 作为可审计的离线兜底。带有可发功率或弃电标记的历史记录会在训练前替换被限发污染的实际出力，避免模型学习到调度限制造成的低功率；预测时同时应用对象容量边界，防止单机或场站结果超过物理上限。数值天气预报先按 15 分钟重采样，再用最近本地观测误差进行滚动偏差修正；小时前和超短期保持本地观测优先，日前与周前使用 NWP 趋势和历史周期特征。接入生产采集后，可通过 `/api/weather-observations` 和 `/api/energy-measurements` 持续写入历史/实时数据，训练、滚动更新和后评估会自动切换到真实数据。
 
 气象预测功能单独覆盖风速、天气温度和太阳辐射：气象预测总览显示未来 15 分钟关键值、未来 24 小时曲线、NWP 与本地站点状态；NWP 资料配置维护主备模型、刷新周期和变量映射；本地观测管理维护站点、采集变量和质量；气象预测运行支持单独执行融合、偏差修正和质量检查；误差评估提供 MAE、RMSE、BIAS 和滚动趋势。曲线、明细、质量和误差趋势使用同一页面内的分页标签，每个标签只展示一个功能面板。
 

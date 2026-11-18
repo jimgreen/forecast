@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 import pandas as pd
 
@@ -19,12 +20,15 @@ class IntegratedForecastPipeline:
     timezone: str = "Pacific/Auckland"
     model: Ridge15MinForecaster | None = None
     history: pd.DataFrame | None = None
+    capacity_limits: Mapping[str, float] = field(default_factory=dict)
 
-    def fit(self, observations: pd.DataFrame, targets: tuple[str, ...] = TARGET_COLUMNS) -> "IntegratedForecastPipeline":
+    def fit(self, observations: pd.DataFrame, targets: tuple[str, ...] = TARGET_COLUMNS, capacity_limits: Mapping[str, float] | None = None) -> "IntegratedForecastPipeline":
         data = to_15min(canonicalize_columns(observations), timestamp_col="timestamp", timezone=self.timezone)
         require_columns(data, [*WEATHER_COLUMNS, *targets], "observations")
         self.history = data
-        self.model = Ridge15MinForecaster(targets=targets).fit(data)
+        if capacity_limits is not None:
+            self.capacity_limits = dict(capacity_limits)
+        self.model = Ridge15MinForecaster(targets=targets, capacity_limits=self.capacity_limits).fit(data)
         return self
 
     def fit_csv(self, path: str | Path, targets: tuple[str, ...] = TARGET_COLUMNS) -> "IntegratedForecastPipeline":

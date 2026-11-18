@@ -38,3 +38,15 @@ def test_hour_ahead_weather_targets_keep_weather_columns():
     assert len(result) == 4
     assert result.index.equals(index.tz_convert("UTC"))
     assert set(result.columns) == {"wind_speed_mps", "temperature_c", "solar_radiation_wm2"}
+
+
+def test_object_capacity_limits_and_hybrid_features():
+    data = make_demo_data()
+    pipeline = IntegratedForecastPipeline().fit(data, capacity_limits={"pv_power_kw": 20.0, "wind_power_kw": 12.0})
+    future = data.tail(1).set_index("timestamp")[["wind_speed_mps", "temperature_c", "solar_radiation_wm2"]]
+    index = pd.date_range(data.timestamp.iloc[-1] + pd.Timedelta(minutes=15), periods=16, freq="15min")
+    future = future.reindex(index).ffill()
+    result = pipeline.predict("ultrashort", future)
+    assert pipeline.model is not None and pipeline.model.feature_count > 15
+    assert result["pv_power_kw"].max() <= 20.0 + 1e-9
+    assert result["wind_power_kw"].max() <= 12.0 + 1e-9

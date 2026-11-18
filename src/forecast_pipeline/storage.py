@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, Mapping, Sequence
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
 DEFAULT_DB_PATH = Path(os.environ.get("FORECAST_DB_PATH", r"D:\codex\sqldb\realtime\forecast\forecast.db"))
 
@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
     target_kind TEXT NOT NULL CHECK(target_kind IN ('weather', 'energy', 'combined')),
     horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     point_id TEXT,
+    object_id TEXT,
     version TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('training', 'active', 'retired', 'failed')),
     artifact_path TEXT,
@@ -196,11 +197,13 @@ CREATE TABLE IF NOT EXISTS model_registry (
     trained_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
+    ,FOREIGN KEY(object_id) REFERENCES forecast_objects(object_id)
 );
 CREATE TABLE IF NOT EXISTS training_runs (
     training_id TEXT PRIMARY KEY,
     model_id TEXT,
     point_id TEXT,
+    object_id TEXT,
     target_kind TEXT NOT NULL CHECK(target_kind IN ('weather', 'energy', 'combined')),
     horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     training_mode TEXT NOT NULL CHECK(training_mode IN ('offline', 'rolling')),
@@ -213,11 +216,13 @@ CREATE TABLE IF NOT EXISTS training_runs (
     error_message TEXT,
     FOREIGN KEY(model_id) REFERENCES model_registry(model_id),
     FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
+    ,FOREIGN KEY(object_id) REFERENCES forecast_objects(object_id)
 );
 CREATE TABLE IF NOT EXISTS model_updates (
     update_id TEXT PRIMARY KEY,
     model_id TEXT NOT NULL,
     point_id TEXT,
+    object_id TEXT,
     horizon TEXT NOT NULL CHECK(horizon IN ('hour_ahead', 'ultrashort', 'day_ahead', 'week_ahead')),
     update_strategy TEXT NOT NULL CHECK(update_strategy IN ('rolling_window', 'incremental', 'retrain')),
     window_size INTEGER,
@@ -227,6 +232,7 @@ CREATE TABLE IF NOT EXISTS model_updates (
     details_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY(model_id) REFERENCES model_registry(model_id),
     FOREIGN KEY(point_id) REFERENCES forecast_points(point_id)
+    ,FOREIGN KEY(object_id) REFERENCES forecast_objects(object_id)
 );
 CREATE TABLE IF NOT EXISTS forecast_schedules (
     schedule_id TEXT PRIMARY KEY,
@@ -327,6 +333,9 @@ class ForecastDB:
             if current_version < 5:
                 self._migrate_v4(conn)
                 conn.executescript(SCHEMA_SQL)
+            if current_version < 6:
+                self._migrate_v6(conn)
+                conn.executescript(SCHEMA_SQL)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_runs_object_started ON forecast_runs(object_id, started_at DESC)")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
@@ -420,6 +429,21 @@ class ForecastDB:
             """
         )
         conn.execute("UPDATE forecast_runs SET object_id=point_id WHERE object_id IS NULL")
+
+    @staticmethod
+    def _migrate_v6(conn: sqlite3.Connection) -> None:
+        """Persist the selected forecast object on model and training records."""
+        additions = {
+            "model_registry": {"object_id": "TEXT"},
+            "training_runs": {"object_id": "TEXT"},
+            "model_updates": {"object_id": "TEXT"},
+        }
+        for table, columns in additions.items():
+            existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, definition in columns.items():
+                if name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_models_object_horizon ON model_registry(object_id, horizon, updated_at DESC)")
 
     def seed_defaults(self) -> None:
         now = utc_now()
@@ -614,26 +638,28 @@ class ForecastDB:
         with self.connection() as conn:
             conn.execute(
                 """INSERT INTO model_registry
-                (model_id,model_name,model_type,target_kind,horizon,point_id,version,status,artifact_path,hyperparams_json,metrics_json,trained_at,updated_at)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                (model_id,model_name,model_type,target_kind,horizon,point_id,object_id,version,status,artifact_path,hyperparams_json,metrics_json,trained_at,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(model_id) DO UPDATE SET model_name=excluded.model_name,model_type=excluded.model_type,
-                target_kind=excluded.target_kind,horizon=excluded.horizon,point_id=excluded.point_id,version=excluded.version,
+                target_kind=excluded.target_kind,horizon=excluded.horizon,point_id=excluded.point_id,object_id=excluded.object_id,version=excluded.version,
                 status=excluded.status,artifact_path=excluded.artifact_path,hyperparams_json=excluded.hyperparams_json,
                 metrics_json=excluded.metrics_json,updated_at=excluded.updated_at""",
-                (model["model_id"], model.get("model_name", "Ridge 15分钟基线"), model.get("model_type", "ridge"),
-                 model.get("target_kind", "combined"), model.get("horizon", "day_ahead"), model.get("point_id"),
+                (model["model_id"], model.get("model_name", "混合特征 Ridge 15分钟"), model.get("model_type", "ridge"),
+                 model.get("target_kind", "combined"), model.get("horizon", "day_ahead"), model.get("point_id"), model.get("object_id"),
                  model.get("version", "v1"), model.get("status", "active"), model.get("artifact_path"),
                  json.dumps(model.get("hyperparams", {}), ensure_ascii=False), json.dumps(model.get("metrics", {}), ensure_ascii=False),
                  model.get("trained_at", now), now),
             )
 
-    def list_models(self, point_id: str | None = None, horizon: str | None = None, limit: int = 100) -> list[dict[str, object]]:
+    def list_models(self, point_id: str | None = None, horizon: str | None = None, object_id: str | None = None, limit: int = 100) -> list[dict[str, object]]:
         limit = min(max(int(limit), 1), 500)
         clauses, params = [], []
         if point_id:
             clauses.append("point_id=?"); params.append(point_id)
         if horizon:
             clauses.append("horizon=?"); params.append(horizon)
+        if object_id:
+            clauses.append("object_id=?"); params.append(object_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connection() as conn:
             rows = conn.execute(f"SELECT * FROM model_registry {where} ORDER BY updated_at DESC LIMIT ?", (*params, limit)).fetchall()
@@ -645,11 +671,11 @@ class ForecastDB:
             result.append(item)
         return result
 
-    def create_training_run(self, training_id: str, point_id: str | None, target_kind: str, horizon: str, mode: str, window_size: int | None = None, model_id: str | None = None) -> None:
+    def create_training_run(self, training_id: str, point_id: str | None, target_kind: str, horizon: str, mode: str, window_size: int | None = None, model_id: str | None = None, object_id: str | None = None) -> None:
         with self.connection() as conn:
             conn.execute(
-                "INSERT INTO training_runs(training_id,model_id,point_id,target_kind,horizon,training_mode,window_size,started_at,status) VALUES(?,?,?,?,?,?,?,?, 'running')",
-                (training_id, model_id, point_id, target_kind, horizon, mode, window_size, utc_now()),
+                "INSERT INTO training_runs(training_id,model_id,point_id,object_id,target_kind,horizon,training_mode,window_size,started_at,status) VALUES(?,?,?,?,?,?,?,?,?, 'running')",
+                (training_id, model_id, point_id, object_id, target_kind, horizon, mode, window_size, utc_now()),
             )
 
     def finish_training_run(self, training_id: str, status: str, model_id: str | None = None, sample_count: int = 0, metrics: Mapping[str, object] | None = None, error_message: str | None = None) -> None:
@@ -670,9 +696,9 @@ class ForecastDB:
     def save_model_update(self, update: Mapping[str, object]) -> None:
         with self.connection() as conn:
             conn.execute(
-                """INSERT INTO model_updates(update_id,model_id,point_id,horizon,update_strategy,window_size,sample_count,status,created_at,details_json)
-                VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                (update["update_id"], update["model_id"], update.get("point_id"), update["horizon"], update.get("update_strategy", "rolling_window"), update.get("window_size"), update.get("sample_count", 0), update.get("status", "success"), update.get("created_at", utc_now()), json.dumps(update.get("details", {}), ensure_ascii=False)),
+                """INSERT INTO model_updates(update_id,model_id,point_id,object_id,horizon,update_strategy,window_size,sample_count,status,created_at,details_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (update["update_id"], update["model_id"], update.get("point_id"), update.get("object_id"), update["horizon"], update.get("update_strategy", "rolling_window"), update.get("window_size"), update.get("sample_count", 0), update.get("status", "success"), update.get("created_at", utc_now()), json.dumps(update.get("details", {}), ensure_ascii=False)),
             )
 
     def list_model_updates(self, limit: int = 50) -> list[dict[str, object]]:
