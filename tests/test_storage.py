@@ -28,6 +28,24 @@ def test_forecast_database_schema_and_roundtrip(tmp_path):
     assert db.health()["tables"]["energy_forecasts"] == 1
 
 
+def test_measurement_queries_apply_sql_time_bounds(tmp_path):
+    db = ForecastDB(tmp_path / "forecast.db")
+    db.initialize()
+    db.seed_defaults()
+    db.save_weather_observations([
+        {"point_id": "P001", "timestamp_utc": "2026-01-01T00:00:00Z", "wind_speed_mps": 1.0, "source": "local"},
+        {"point_id": "P001", "timestamp_utc": "2026-01-01T00:15:00Z", "wind_speed_mps": 2.0, "source": "local"},
+    ])
+    db.save_energy_measurements([
+        {"point_id": "P001", "timestamp_utc": "2026-01-01T00:00:00Z", "pv_power_kw": 1.0, "source": "local"},
+        {"point_id": "P001", "timestamp_utc": "2026-01-01T00:15:00Z", "pv_power_kw": 2.0, "source": "local"},
+    ])
+    weather = db.list_weather_observations("P001", 20, "2026-01-01T00:15:00Z", "2026-01-01T00:15:00Z")
+    energy = db.list_energy_measurements("P001", 20, "2026-01-01T00:15:00Z", "2026-01-01T00:15:00Z")
+    assert [row["wind_speed_mps"] for row in weather] == [2.0]
+    assert [row["pv_power_kw"] for row in energy] == [2.0]
+
+
 def test_model_schedule_and_evaluation_roundtrip(tmp_path):
     db = ForecastDB(tmp_path / "forecast.db")
     db.initialize()

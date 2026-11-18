@@ -7,6 +7,14 @@ html,body{height:100%;overflow:hidden}.app-shell{height:100vh;min-height:0;overf
 @media(max-width:520px){.weather-kpi-grid,.weather-metric-grid{grid-template-columns:1fr}.page-tabs{overflow:hidden}.page-tab{font-size:10px;padding-left:7px;padding-right:7px}}
 .table-wrap{overflow:hidden}.table-wrap table{width:100%;min-width:0;table-layout:fixed}.table-wrap th,.table-wrap td{overflow:hidden;text-overflow:ellipsis}
 @media(max-width:520px){.sub-panel>.kpi-grid,.weather-kpi-grid,.point-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}.kpi-card{min-height:118px;padding:13px}.kpi-card strong{font-size:23px;margin-top:9px}.kpi-unit{font-size:9px}.sparkline{height:22px;margin-top:7px}.coverage-bar{margin-top:15px}.point-card{padding:13px}.point-card h3{font-size:12px}.point-meta{grid-template-columns:1fr;margin:13px 0 10px;gap:7px}.point-meta b{font-size:11px}.point-footer{display:block}.point-footer button{display:block;margin-top:6px}}
+.quality-grid{grid-template-columns:repeat(5,minmax(0,1fr))}
+.status-grid{grid-template-columns:repeat(5,minmax(0,1fr))}
+@media(max-width:1200px){.quality-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1200px){.status-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:800px){.quality-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:800px){.status-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:520px){.quality-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}
+@media(max-width:520px){.status-grid{grid-template-columns:1fr}}
 /* Keep the HMI inside the application viewport. Long functional pages scroll
    inside their own view with the scrollbar chrome hidden. */
 html,body{height:100%;overflow:hidden}.app-shell{height:100vh;min-height:0;overflow:hidden}.main-area{height:100vh;overflow:hidden}.content{height:calc(100vh - 67px);overflow:hidden}.view.active{height:100%;overflow-y:auto;overflow-x:hidden;scrollbar-width:none}.view.active::-webkit-scrollbar{width:0;height:0}.view.active{overscroll-behavior:contain}.line-chart,.line-chart.large{max-width:100%;overflow:hidden}.table-wrap{max-width:100%;overflow-x:auto;scrollbar-width:none}.table-wrap::-webkit-scrollbar{height:0}

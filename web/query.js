@@ -45,7 +45,8 @@ async function queryPage(kind) {
       path='/api/forecast?'+params;
     }else{
       field=kind==='weather'?'observations':'measurements';
-      path='/api/'+(kind==='weather'?'weather-observations':'energy-measurements')+'?'+new URLSearchParams({point_id:point,limit:hours*4});
+      const end=new Date(),start=new Date(end.getTime()-hours*3600000);
+      path='/api/'+(kind==='weather'?'weather-observations':'energy-measurements')+'?'+new URLSearchParams({point_id:point,limit:String(hours*4),start:start.toISOString(),end:end.toISOString()});
     }
     const response=await fetch(path,{signal:snapshot.controller.signal});
     const data=await response.json();

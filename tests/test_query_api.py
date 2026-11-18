@@ -92,3 +92,15 @@ def test_unconfirmed_available_power_stays_out_of_training_frame(tmp_path, monke
     }]))
     assert prepared.iloc[0]['pv_power_kw'] == 10
     assert quality == {'curtailment_samples': 0, 'adjusted_samples': 0}
+
+
+def test_measurement_api_applies_sql_time_bounds(api):
+    result = json.load(urlopen(api + '/api/energy-measurements?point_id=P002&limit=20&start=2026-01-01T00:15:00Z&end=2026-01-01T00:15:00Z'))
+    assert result['count'] == 1
+    assert result['measurements'][0]['timestamp_utc'] == '2026-01-01T00:15:00Z'
+
+
+def test_invalid_measurement_time_range_is_rejected(api):
+    with pytest.raises(HTTPError) as error:
+        urlopen(api + '/api/energy-measurements?point_id=P002&start=2026-01-02T00:00:00Z&end=2026-01-01T00:00:00Z')
+    assert error.value.code == 400

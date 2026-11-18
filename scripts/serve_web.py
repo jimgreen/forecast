@@ -71,6 +71,14 @@ def parse_dt(value: object) -> datetime:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
+def query_time_bound(query: dict[str, list[str]], key: str) -> str | None:
+    """Normalize an optional ISO-8601 query bound for SQLite comparisons."""
+    value = query.get(key, [None])[0]
+    if not value:
+        return None
+    return parse_dt(value).isoformat().replace("+00:00", "Z")
+
+
 def load_demo_frame() -> pd.DataFrame:
     return _load_demo_frame_cached().copy()
 
@@ -736,11 +744,21 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/evaluations":
                 self.json_response({"evaluations": DB.list_evaluations(query.get("run_id", [None])[0], query.get("point_id", [None])[0], int(query.get("limit", [100])[0]))})
             elif parsed.path == "/api/weather-observations":
-                self.json_response({"observations": DB.list_weather_observations(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
+                start_utc = query_time_bound(query, "start")
+                end_utc = query_time_bound(query, "end")
+                if start_utc and end_utc and start_utc > end_utc:
+                    raise ValueError("start must be before end")
+                rows = DB.list_weather_observations(query.get("point_id", [None])[0], query.get("limit", [96])[0], start_utc, end_utc)
+                self.json_response({"observations": rows, "count": len(rows), "start_utc": start_utc, "end_utc": end_utc})
             elif parsed.path == "/api/nwp-forecasts":
                 self.json_response({"forecasts": DB.list_nwp_forecasts(query.get("point_id", [None])[0], query.get("horizon", [None])[0], query.get("limit", [672])[0])})
             elif parsed.path == "/api/energy-measurements":
-                self.json_response({"measurements": DB.list_energy_measurements(query.get("point_id", [None])[0], query.get("limit", [96])[0])})
+                start_utc = query_time_bound(query, "start")
+                end_utc = query_time_bound(query, "end")
+                if start_utc and end_utc and start_utc > end_utc:
+                    raise ValueError("start must be before end")
+                rows = DB.list_energy_measurements(query.get("point_id", [None])[0], query.get("limit", [96])[0], start_utc, end_utc)
+                self.json_response({"measurements": rows, "count": len(rows), "start_utc": start_utc, "end_utc": end_utc})
             elif parsed.path == "/api/curtailment-events":
                 self.json_response({"events": DB.list_curtailment_events(query.get("point_id", [None])[0], query.get("limit", [100])[0])})
             else:
@@ -813,10 +831,18 @@ class Handler(BaseHTTPRequestHandler):
                 if object_ids:
                     resolved = [DB.resolve_object(str(object_id)) for object_id in object_ids]
                     if any(item is None for item in resolved): raise ValueError("unknown object_id")
-                    results = [train_model(str(item["point_id"]), str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), str(payload.get("mode", "offline")), int(payload["window_size"]) if payload.get("window_size") else None, str(item["object_id"]), str(payload.get("strategy", "hybrid_ridge"))) for item in resolved if item]
+                    train_specs = [(str(item["point_id"]), str(item["object_id"])) for item in resolved if item]
                 else:
                     point_ids = payload.get("point_ids") or [payload.get("point_id")]
-                    results = [train_model(str(point_id) if point_id else None, str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), str(payload.get("mode", "offline")), int(payload["window_size"]) if payload.get("window_size") else None, None, str(payload.get("strategy", "hybrid_ridge"))) for point_id in point_ids]
+                    train_specs = [(str(point_id) if point_id else None, None) for point_id in point_ids]
+                def train_one(spec: tuple[str | None, str | None]) -> dict[str, object]:
+                    point_id, object_id = spec
+                    return train_model(point_id, str(payload.get("target_kind", "combined")), str(payload.get("horizon", "day_ahead")), str(payload.get("mode", "offline")), int(payload["window_size"]) if payload.get("window_size") else None, object_id, str(payload.get("strategy", "hybrid_ridge")))
+                if len(train_specs) > 1:
+                    with ThreadPoolExecutor(max_workers=min(4, len(train_specs)), thread_name_prefix="forecast-train") as pool:
+                        results = list(pool.map(train_one, train_specs))
+                else:
+                    results = [train_one(train_specs[0])] if train_specs else []
                 self.json_response({"status": "success", "results": results})
             elif parsed.path == "/api/model-update":
                 point_id = payload.get("point_id")

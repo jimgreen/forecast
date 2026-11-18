@@ -954,22 +954,46 @@ class ForecastDB:
                 rows = conn.execute("SELECT * FROM curtailment_events ORDER BY start_time_utc DESC LIMIT ?", (limit,)).fetchall()
         return [dict(row) for row in rows]
 
-    def list_weather_observations(self, point_id: str | None = None, limit: int | str = 96) -> list[dict[str, object]]:
+    def list_weather_observations(
+        self,
+        point_id: str | None = None,
+        limit: int | str = 96,
+        start_utc: str | None = None,
+        end_utc: str | None = None,
+    ) -> list[dict[str, object]]:
         limit = min(max(int(limit), 1), 2000)
+        clauses: list[str] = []
+        params: list[object] = []
+        if point_id:
+            clauses.append("point_id=?"); params.append(point_id)
+        if start_utc:
+            clauses.append("timestamp_utc>=?"); params.append(start_utc)
+        if end_utc:
+            clauses.append("timestamp_utc<=?"); params.append(end_utc)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connection() as conn:
-            if point_id:
-                rows = conn.execute("SELECT * FROM weather_observations WHERE point_id=? ORDER BY timestamp_utc DESC LIMIT ?", (point_id, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM weather_observations ORDER BY timestamp_utc DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(f"SELECT * FROM weather_observations{where} ORDER BY timestamp_utc DESC LIMIT ?", (*params, limit)).fetchall()
         return [dict(row) for row in rows]
 
-    def list_energy_measurements(self, point_id: str | None = None, limit: int | str = 96) -> list[dict[str, object]]:
+    def list_energy_measurements(
+        self,
+        point_id: str | None = None,
+        limit: int | str = 96,
+        start_utc: str | None = None,
+        end_utc: str | None = None,
+    ) -> list[dict[str, object]]:
         limit = min(max(int(limit), 1), 2000)
+        clauses: list[str] = []
+        params: list[object] = []
+        if point_id:
+            clauses.append("point_id=?"); params.append(point_id)
+        if start_utc:
+            clauses.append("timestamp_utc>=?"); params.append(start_utc)
+        if end_utc:
+            clauses.append("timestamp_utc<=?"); params.append(end_utc)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connection() as conn:
-            if point_id:
-                rows = conn.execute("SELECT * FROM energy_measurements WHERE point_id=? ORDER BY timestamp_utc DESC LIMIT ?", (point_id, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM energy_measurements ORDER BY timestamp_utc DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(f"SELECT * FROM energy_measurements{where} ORDER BY timestamp_utc DESC LIMIT ?", (*params, limit)).fetchall()
         return [dict(row) for row in rows]
 
     def save_forecast_rows(self, run_id: str, point_id: str, horizon: str, rows: Iterable[Mapping[str, object]], kind: str = "combined", model_name: str = "Ridge 15分钟基线", source: str = "local") -> int:
