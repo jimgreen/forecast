@@ -25,6 +25,13 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime(UTC_FORMAT)
 
 
+def _explicit_bool(value: object) -> bool:
+    """Interpret an ingestion flag without treating ``"false"`` as true."""
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -876,6 +883,17 @@ class ForecastDB:
         return count
 
     def save_energy_measurements(self, rows: Iterable[Mapping[str, object]]) -> int:
+        """Persist measured power and explicit curtailment provenance.
+
+        A difference between available and measured power is only a candidate
+        curtailment signal.  It can be caused by forecast error, telemetry
+        delay, plant limits, or missing values, so it must not be promoted to
+        a confirmed event at ingestion time.  ``curtailment_flag`` or a
+        non-empty ``curtailment_reason`` is the confirmation supplied by the
+        source/operator.  Explicit loss values are retained for audit even
+        when they are unconfirmed, but downstream summaries and training use
+        only rows whose confirmation flag is set.
+        """
         count = 0
         with self.connection() as conn:
             for row in rows:
@@ -885,11 +903,16 @@ class ForecastDB:
                 wind_available = row.get("wind_available_power_kw", row.get("available_wind_power_kw"))
                 pv_loss = row.get("pv_curtailment_kw")
                 wind_loss = row.get("wind_curtailment_kw")
-                if pv_loss is None and pv_available is not None and pv_actual is not None:
+                reason_value = row.get("curtailment_reason")
+                reason = str(reason_value).strip() if reason_value is not None else ""
+                curtailment_flag = _explicit_bool(row.get("curtailment_flag", False)) or bool(reason)
+                # Once the source confirms curtailment, derive a missing loss
+                # from the paired available/measured values.  Without that
+                # confirmation, keep the raw values but leave the flag clear.
+                if curtailment_flag and pv_loss is None and pv_available is not None and pv_actual is not None:
                     pv_loss = max(float(pv_available) - float(pv_actual), 0.0)
-                if wind_loss is None and wind_available is not None and wind_actual is not None:
+                if curtailment_flag and wind_loss is None and wind_available is not None and wind_actual is not None:
                     wind_loss = max(float(wind_available) - float(wind_actual), 0.0)
-                curtailment_flag = bool(row.get("curtailment_flag", False) or float(pv_loss or 0) > 1e-6 or float(wind_loss or 0) > 1e-6)
                 conn.execute(
                     """INSERT INTO energy_measurements
                     (point_id,timestamp_utc,pv_power_kw,wind_power_kw,load_kw,pv_available_power_kw,wind_available_power_kw,
@@ -901,7 +924,7 @@ class ForecastDB:
                     wind_curtailment_kw=excluded.wind_curtailment_kw,curtailment_flag=excluded.curtailment_flag,
                     curtailment_reason=excluded.curtailment_reason,quality_code=excluded.quality_code,is_realtime=excluded.is_realtime,received_at=excluded.received_at""",
                     (row["point_id"], row["timestamp_utc"], pv_actual, wind_actual, row.get("load_kw"), pv_available,
-                     wind_available, pv_loss, wind_loss, int(curtailment_flag), row.get("curtailment_reason"),
+                    wind_available, pv_loss, wind_loss, int(curtailment_flag), reason or None,
                      row.get("source", "local"), row.get("quality_code", "valid"), int(bool(row.get("is_realtime", False))), row.get("received_at", utc_now())),
                 )
                 count += 1

@@ -90,8 +90,10 @@ def load_observation_frame(point_id: str | None) -> pd.DataFrame:
         rows = conn.execute(
             """SELECT COALESCE(w.timestamp_utc,e.timestamp_utc) AS timestamp,
             w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
-            COALESCE(e.pv_available_power_kw,e.pv_power_kw) AS pv_power_kw,
-            COALESCE(e.wind_available_power_kw,e.wind_power_kw) AS wind_power_kw,
+            CASE WHEN e.curtailment_flag=1 OR NULLIF(TRIM(e.curtailment_reason),'') IS NOT NULL
+                 THEN COALESCE(e.pv_available_power_kw,e.pv_power_kw) ELSE e.pv_power_kw END AS pv_power_kw,
+            CASE WHEN e.curtailment_flag=1 OR NULLIF(TRIM(e.curtailment_reason),'') IS NOT NULL
+                 THEN COALESCE(e.wind_available_power_kw,e.wind_power_kw) ELSE e.wind_power_kw END AS wind_power_kw,
             e.load_kw,e.pv_power_kw AS measured_pv_power_kw,e.wind_power_kw AS measured_wind_power_kw,
             e.pv_available_power_kw,e.wind_available_power_kw,e.pv_curtailment_kw,e.wind_curtailment_kw,
             e.curtailment_flag,e.curtailment_reason
@@ -101,8 +103,10 @@ def load_observation_frame(point_id: str | None) -> pd.DataFrame:
             UNION ALL
             SELECT e.timestamp_utc AS timestamp,
             w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
-            COALESCE(e.pv_available_power_kw,e.pv_power_kw) AS pv_power_kw,
-            COALESCE(e.wind_available_power_kw,e.wind_power_kw) AS wind_power_kw,
+            CASE WHEN e.curtailment_flag=1 OR NULLIF(TRIM(e.curtailment_reason),'') IS NOT NULL
+                 THEN COALESCE(e.pv_available_power_kw,e.pv_power_kw) ELSE e.pv_power_kw END AS pv_power_kw,
+            CASE WHEN e.curtailment_flag=1 OR NULLIF(TRIM(e.curtailment_reason),'') IS NOT NULL
+                 THEN COALESCE(e.wind_available_power_kw,e.wind_power_kw) ELSE e.wind_power_kw END AS wind_power_kw,
             e.load_kw,e.pv_power_kw AS measured_pv_power_kw,e.wind_power_kw AS measured_wind_power_kw,
             e.pv_available_power_kw,e.wind_available_power_kw,e.pv_curtailment_kw,e.wind_curtailment_kw,
             e.curtailment_flag,e.curtailment_reason
@@ -147,8 +151,10 @@ def load_energy_observation_frame(point_id: str | None) -> pd.DataFrame:
     with DB.connection() as conn:
         rows = conn.execute(
             """SELECT timestamp_utc AS timestamp,
-               COALESCE(pv_available_power_kw,pv_power_kw) AS pv_power_kw,
-               COALESCE(wind_available_power_kw,wind_power_kw) AS wind_power_kw,
+               CASE WHEN curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL
+                    THEN COALESCE(pv_available_power_kw,pv_power_kw) ELSE pv_power_kw END AS pv_power_kw,
+               CASE WHEN curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL
+                    THEN COALESCE(wind_available_power_kw,wind_power_kw) ELSE wind_power_kw END AS wind_power_kw,
                load_kw,pv_power_kw AS measured_pv_power_kw,wind_power_kw AS measured_wind_power_kw,
                pv_available_power_kw,wind_available_power_kw,pv_curtailment_kw,wind_curtailment_kw,
                curtailment_flag,curtailment_reason,source
@@ -226,19 +232,27 @@ def capacity_limits(point_id: str | None, object_id: str | None = None) -> dict[
 
 
 def prepare_power_training_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, int]]:
-    """Use available power when curtailment metadata proves measured output is clipped."""
+    """Use available power only when curtailment metadata proves clipping.
+
+    Available-minus-measured power is deliberately not treated as proof: it
+    may be a forecast error or a telemetry/data-quality issue.  The ingestion
+    layer sets ``curtailment_flag`` only for an explicit source/operator
+    confirmation (including a non-empty reason).
+    """
     if frame.empty:
         return frame, {"curtailment_samples": 0, "adjusted_samples": 0}
     result = frame.copy()
     source = result.get("source", pd.Series("", index=result.index)).fillna("").astype(str).str.lower().str.strip()
     authoritative = ~source.isin({"test", "demo", "seed", "sample", "mock", "fixture"})
-    flag = result.get("curtailment_flag", pd.Series(False, index=result.index)).fillna(0).astype(bool) & authoritative
+    explicit_flag = result.get("curtailment_flag", pd.Series(False, index=result.index)).fillna(0).astype(bool)
+    explicit_reason = result.get("curtailment_reason", pd.Series("", index=result.index)).fillna("").astype(str).str.strip().ne("")
+    flag = (explicit_flag | explicit_reason) & authoritative
     adjusted = 0
     adjusted_mask = pd.Series(False, index=result.index)
     for target, available in (("pv_power_kw", "pv_available_power_kw"), ("wind_power_kw", "wind_available_power_kw")):
         if available in result:
             available_values = pd.to_numeric(result[available], errors="coerce")
-            use = available_values.notna() & authoritative & (flag | (available_values > pd.to_numeric(result[target], errors="coerce")))
+            use = available_values.notna() & authoritative & flag
             result.loc[use, target] = available_values.loc[use]
             adjusted += int(use.sum())
             adjusted_mask = adjusted_mask | use
@@ -258,16 +272,24 @@ def curtailment_summary(point_id: str | None = None) -> dict[str, object]:
         row = conn.execute(
             f"""SELECT COUNT(*) AS samples,
                 SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
-                    AND (curtailment_flag=1 OR pv_curtailment_kw IS NOT NULL OR wind_curtailment_kw IS NOT NULL) THEN 1 ELSE 0 END) AS known_samples,
+                    AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL) THEN 1 ELSE 0 END) AS known_samples,
                 SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL)
                     THEN COALESCE(pv_curtailment_kw,0) ELSE 0 END) AS pv_loss_kw,
                 SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL)
                     THEN COALESCE(wind_curtailment_kw,0) ELSE 0 END) AS wind_loss_kw
+                ,MIN(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL)
+                    THEN timestamp_utc END) AS first_confirmed_at
+                ,MAX(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL)
+                    THEN timestamp_utc END) AS last_confirmed_at
                 FROM energy_measurements {where}""", params,
         ).fetchone()
     samples = int(row["samples"] or 0)
     known = int(row["known_samples"] or 0)
-    return {"samples": samples, "known": bool(known), "curtailment_samples": known, "unknown_samples": max(0, samples-known), "curtailment_rate": round(known / samples * 100, 2) if known else None, "pv_loss_kw": float(row["pv_loss_kw"]) if known else None, "wind_loss_kw": float(row["wind_loss_kw"]) if known else None}
+    return {"samples": samples, "known": bool(known), "curtailment_samples": known, "unknown_samples": max(0, samples-known), "curtailment_rate": round(known / samples * 100, 2) if known else None, "pv_loss_kw": float(row["pv_loss_kw"]) if known else None, "wind_loss_kw": float(row["wind_loss_kw"]) if known else None, "first_confirmed_at": row["first_confirmed_at"] if known else None, "last_confirmed_at": row["last_confirmed_at"] if known else None}
 
 
 def forecast_anchor(frame: pd.DataFrame) -> pd.Timestamp:
@@ -449,13 +471,14 @@ def evaluate_run(run_id: str) -> dict[str, object]:
             actual_table = "weather_observations" if target in WEATHER_TARGETS else "energy_measurements"
             forecast_rows = conn.execute(f"SELECT target_time_utc,{target} AS value FROM {table} WHERE run_id=?", (run_id,)).fetchall()
             authoritative_sql = "LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')"
+            confirmed_sql = f"{authoritative_sql} AND (curtailment_flag=1 OR NULLIF(TRIM(curtailment_reason),'') IS NOT NULL)"
             if target == "pv_power_kw":
-                actual_sql = f"CASE WHEN {authoritative_sql} THEN COALESCE(pv_available_power_kw,pv_power_kw) ELSE pv_power_kw END"
+                actual_sql = f"CASE WHEN {confirmed_sql} THEN COALESCE(pv_available_power_kw,pv_power_kw) ELSE pv_power_kw END"
             elif target == "wind_power_kw":
-                actual_sql = f"CASE WHEN {authoritative_sql} THEN COALESCE(wind_available_power_kw,wind_power_kw) ELSE wind_power_kw END"
+                actual_sql = f"CASE WHEN {confirmed_sql} THEN COALESCE(wind_available_power_kw,wind_power_kw) ELSE wind_power_kw END"
             else:
                 actual_sql = target
-            flag_sql = f"CASE WHEN {authoritative_sql} THEN curtailment_flag ELSE 0 END" if target in ENERGY_TARGETS else "0"
+            flag_sql = f"CASE WHEN {confirmed_sql} THEN 1 ELSE 0 END" if target in ENERGY_TARGETS else "0"
             source_filter = " AND LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')" if target in ENERGY_TARGETS else ""
             actual_rows = conn.execute(f"SELECT timestamp_utc,{actual_sql} AS value,{flag_sql} AS curtailment_flag FROM {actual_table} WHERE point_id=?{source_filter}", (run["point_id"],)).fetchall()
             actual = pd.Series({parse_dt(row["timestamp_utc"]): row["value"] for row in actual_rows}, dtype=float)
@@ -468,7 +491,7 @@ def evaluate_run(run_id: str) -> dict[str, object]:
         available = [value for value in details.values() if value.get("sample_count", 0)]
         status = "success" if available else "pending"
         aggregate = {key: float(np.mean([float(value[key]) for value in available if value.get(key) is not None])) for key in ("mae", "rmse", "bias", "nmae")} if available else {key: None for key in ("mae", "rmse", "bias", "nmae")}
-        evaluation = {"evaluation_id": previous["evaluation_id"] if previous else new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details, "evaluation_basis": "available_power_for_curtailment"}
+        evaluation = {"evaluation_id": previous["evaluation_id"] if previous else new_id("EVA"), "run_id": run_id, "point_id": run["point_id"], "forecast_kind": forecast_kind, "horizon": run["horizon"], "window_start": None, "window_end": None, "sample_count": paired, "status": status, **aggregate, "coverage": None, "metrics": details, "evaluation_basis": "available_power_only_when_confirmed"}
     DB.save_evaluation(evaluation)
     return evaluation
 

@@ -5,6 +5,7 @@ from pathlib import Path
 from urllib.request import urlopen
 from urllib.error import HTTPError
 
+import pandas as pd
 import pytest
 from forecast_pipeline import storage
 
@@ -20,6 +21,7 @@ def api(tmp_path, monkeypatch):
     module.DB.create_run('QUERY-NEW', 'P002', 'energy', 'hour_ahead', object_id='OBJ-WIND-P002')
     module.DB.save_forecast_rows('QUERY-NEW', 'P002', 'hour_ahead', [{'timestamp':'2026-01-01T00:00:00Z','wind_power_kw':99}], kind='energy')
     module.DB.save_energy_measurements([{'point_id':'P002','timestamp_utc':'2026-01-01T00:00:00Z','pv_power_kw':10,'pv_available_power_kw':20,'source':'test'}])
+    module.DB.save_energy_measurements([{'point_id':'P002','timestamp_utc':'2026-01-01T00:15:00Z','pv_power_kw':10,'pv_available_power_kw':20,'pv_curtailment_kw':10,'source':'local'}])
     server = module.ThreadingHTTPServer(('127.0.0.1', 0), module.Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
     worker.start()
@@ -61,4 +63,32 @@ def test_test_source_curtailment_is_reported_as_unknown(api):
     result = json.load(urlopen(api + '/api/curtailment-summary?point_id=P002'))
     assert result['known'] is False
     assert result['curtailment_samples'] == 0
+    assert result['unknown_samples'] == 2
     assert result['pv_loss_kw'] is None
+    assert result['first_confirmed_at'] is None
+    assert result['last_confirmed_at'] is None
+
+
+def test_unconfirmed_available_power_stays_out_of_training_frame(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, 'DEFAULT_DB_PATH', tmp_path / 'forecast.db')
+    spec = importlib.util.spec_from_file_location('unconfirmed_training_web', Path(__file__).parents[1] / 'scripts/serve_web.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.DB.save_energy_measurements([{
+        'point_id': 'P002',
+        'timestamp_utc': '2026-01-01T00:00:00Z',
+        'pv_power_kw': 10,
+        'pv_available_power_kw': 20,
+        'source': 'local',
+    }])
+    frame = module.load_energy_observation_frame('P002')
+    assert frame.iloc[0]['pv_power_kw'] == 10
+    prepared, quality = module.prepare_power_training_frame(pd.DataFrame([{
+        'timestamp': '2026-01-01T00:00:00Z',
+        'source': 'local',
+        'pv_power_kw': 10,
+        'pv_available_power_kw': 20,
+        'curtailment_flag': 0,
+    }]))
+    assert prepared.iloc[0]['pv_power_kw'] == 10
+    assert quality == {'curtailment_samples': 0, 'adjusted_samples': 0}
