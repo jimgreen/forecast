@@ -30,6 +30,7 @@ DATA = ROOT / "demo_week_ahead_forecast.csv"
 MODEL_DIR = ROOT / "data" / "models"
 sys.path.insert(0, str(ROOT / "src"))
 
+from forecast_pipeline.cache import PipelineCache  # noqa: E402
 from forecast_pipeline.pipeline import IntegratedForecastPipeline  # noqa: E402
 from forecast_pipeline.fusion import fuse_weather  # noqa: E402
 from forecast_pipeline.providers import OpenMeteoProvider  # noqa: E402
@@ -321,36 +322,11 @@ def fused_future_weather(point_id: str, horizon: str, future_index: pd.DatetimeI
     return fused.reindex(future_index)[list(WEATHER_TARGETS)].interpolate(method="time").ffill().bfill()
 
 
-_PIPELINE_CACHE: dict[tuple[object, ...], IntegratedForecastPipeline] = {}
-_PIPELINE_CACHE_LOCK = threading.RLock()
+_PIPELINE_CACHE = PipelineCache(maxsize=16)
 
 
-def cached_pipeline(
-    history: pd.DataFrame,
-    targets: tuple[str, ...],
-    capacity_limits: dict[str, float],
-    cache_scope: str,
-) -> IntegratedForecastPipeline:
-    """Reuse a fitted pipeline while the input tail and limits are unchanged."""
-    required = [*WEATHER_TARGETS, *targets]
-    sample = history[required].tail(8)
-    fingerprint = int(pd.util.hash_pandas_object(sample, index=True).sum()) if not sample.empty else 0
-    key = (
-        cache_scope,
-        len(history),
-        str(history.index[-1]) if len(history.index) else "",
-        fingerprint,
-        targets,
-        tuple(sorted(capacity_limits.items())),
-    )
-    with _PIPELINE_CACHE_LOCK:
-        pipeline = _PIPELINE_CACHE.get(key)
-        if pipeline is None:
-            pipeline = IntegratedForecastPipeline().fit(history, targets=targets, capacity_limits=capacity_limits)
-            _PIPELINE_CACHE[key] = pipeline
-            while len(_PIPELINE_CACHE) > 16:
-                _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
-        return pipeline
+def cached_pipeline(history, targets, capacity_limits, cache_scope):
+    return _PIPELINE_CACHE.get(history, targets, capacity_limits, cache_scope)
 
 
 @lru_cache(maxsize=4)
@@ -654,13 +630,45 @@ class Handler(BaseHTTPRequestHandler):
                 point_id = query.get("point_id", ["P001"])[0]; horizon = query.get("horizon", ["day_ahead"])[0]
                 if horizon not in HORIZONS: raise ValueError("unsupported horizon")
                 object_id = query.get("object_id", [None])[0]
-                if object_id:
-                    obj = DB.resolve_object(object_id)
-                    if not obj: raise ValueError("unknown object_id")
-                    point_id = str(obj["point_id"])
                 run_id = query.get("run_id", [None])[0]
+                if run_id:
+                    with DB.connection() as conn:
+                        run = conn.execute("SELECT * FROM forecast_runs WHERE run_id=?", (run_id,)).fetchone()
+                    if run is None:
+                        raise ValueError("run not found")
+                    for field in ("point_id", "object_id", "horizon"):
+                        if field in query and query[field][0] != run[field]:
+                            raise ValueError(f"{field} does not match run")
+                    point_id, object_id, horizon = run["point_id"], run["object_id"], run["horizon"]
+                elif object_id:
+                    obj = DB.resolve_object(object_id)
+                    if not obj:
+                        # Legacy point-scoped runs remain queryable after the
+                        # object catalogue has been introduced or changed.
+                        with DB.connection() as conn:
+                            obj = conn.execute(
+                                "SELECT point_id FROM forecast_runs WHERE object_id=? ORDER BY started_at DESC LIMIT 1",
+                                (object_id,),
+                            ).fetchone()
+                    if not obj:
+                        raise ValueError("unknown object_id")
+                    point_id = str(obj["point_id"])
+                kind = query.get("kind", [None])[0]
+                if kind is not None and kind not in KINDS:
+                    raise ValueError("unsupported kind")
+                if not run_id:
+                    with DB.connection() as conn:
+                        latest = conn.execute(
+                            """SELECT run_id,object_id FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
+                            AND (? IS NULL OR object_id=?) AND (? IS NULL OR forecast_kind=? OR forecast_kind='combined')
+                            ORDER BY COALESCE(finished_at,started_at) DESC,started_at DESC LIMIT 1""",
+                            (point_id, horizon, object_id, object_id, kind, kind),
+                        ).fetchone()
+                    run_id = latest["run_id"] if latest else None
+                    if latest:
+                        object_id = latest["object_id"]
                 requested_limit = min(max(int(query.get("limit", [horizon_count(horizon)])[0]), 1), 2000)
-                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id)})
+                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id, kind)})
             elif parsed.path == "/api/runs":
                 self.json_response({"runs": DB.list_runs(
                     min(max(int(query.get("limit", [50])[0]), 1), 200),

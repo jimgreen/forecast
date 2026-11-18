@@ -138,3 +138,13 @@ def test_run_filters_keep_horizon_and_object_scope(tmp_path):
     db.create_run("RUN-DAY", "P002", "energy", "day_ahead", object_id="OBJ-WIND-P002")
     assert [row["run_id"] for row in db.list_runs(horizon="hour_ahead")] == ["RUN-HOUR"]
     assert [row["run_id"] for row in db.list_runs(object_id="OBJ-WIND-P002")] == ["RUN-DAY"]
+def test_exact_run_and_weather_kind_do_not_use_another_object(tmp_path):
+    db = ForecastDB(tmp_path / 'forecast.db')
+    db.initialize()
+    db.seed_defaults()
+    for name, kind, object_id, value in [('OLD', 'weather', 'OBJ-GRID', 1), ('NEW', 'energy', 'OBJ-PV-P001-U01', 99)]:
+        db.create_run(name, 'P001', kind, 'week_ahead', object_id=object_id)
+        db.save_forecast_rows(name, 'P001', 'week_ahead', [{'timestamp': '2026-01-01T00:00:00Z', 'wind_speed_mps': value, 'pv_power_kw': value}], kind=kind)
+    assert db.get_forecast_rows('P001', 'week_ahead', 672, kind='weather')[0]['wind_speed_mps'] == 1
+    assert db.get_forecast_rows('P001', 'week_ahead', 672, run_id='OLD')[0]['wind_speed_mps'] == 1
+    assert db.get_forecast_rows('P001', 'week_ahead', 672, run_id='OLD', object_id='OBJ-PV-P001-U01') == []

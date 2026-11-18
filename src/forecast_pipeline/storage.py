@@ -972,15 +972,16 @@ class ForecastDB:
         self.finish_run(run_id, "success", len(rows))
         return len(rows)
 
-    def get_forecast_rows(self, point_id: str, horizon: str, limit: int, run_id: str | None = None, object_id: str | None = None) -> list[dict[str, object]]:
+    def get_forecast_rows(self, point_id: str, horizon: str, limit: int, run_id: str | None = None, object_id: str | None = None, kind: str | None = None) -> list[dict[str, object]]:
         with self.connection() as conn:
-            latest_filter = "l.run_id=?" if run_id else "l.rn=1"
-            latest_params: tuple[object, ...] = (run_id,) if run_id else ()
             rows = conn.execute(
-                f"""WITH latest AS (
-                    SELECT run_id, object_id, ROW_NUMBER() OVER (ORDER BY COALESCE(finished_at, started_at) DESC, started_at DESC) AS rn
+                """WITH latest AS (
+                    SELECT run_id, object_id
                     FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
                     AND (? IS NULL OR object_id=?)
+                    AND (? IS NULL OR forecast_kind=? OR forecast_kind='combined')
+                    AND (? IS NULL OR run_id=?)
+                    ORDER BY COALESCE(finished_at,started_at) DESC,started_at DESC LIMIT 1
                 )
                 SELECT timestamp,wind_speed_mps,temperature_c,solar_radiation_wm2,
                 pv_power_kw,wind_power_kw,load_kw,source FROM (
@@ -991,7 +992,7 @@ class ForecastDB:
                     FROM weather_forecasts w LEFT JOIN energy_forecasts e
                     ON w.run_id=e.run_id AND w.target_time_utc=e.target_time_utc
                     JOIN latest l ON l.run_id=w.run_id
-                    WHERE w.point_id=? AND w.horizon=? AND {latest_filter}
+                    WHERE w.point_id=? AND w.horizon=?
                     UNION ALL
                     SELECT e.target_time_utc AS timestamp,
                     w.wind_speed_mps,w.temperature_c,w.solar_radiation_wm2,
@@ -1000,9 +1001,9 @@ class ForecastDB:
                     FROM energy_forecasts e LEFT JOIN weather_forecasts w
                     ON w.run_id=e.run_id AND w.target_time_utc=e.target_time_utc
                     JOIN latest l ON l.run_id=e.run_id
-                    WHERE e.point_id=? AND e.horizon=? AND w.run_id IS NULL AND {latest_filter}
+                    WHERE e.point_id=? AND e.horizon=? AND w.run_id IS NULL
                 ) ORDER BY timestamp LIMIT ?""",
-                (point_id, horizon, object_id, object_id, point_id, horizon, *latest_params, point_id, horizon, *latest_params, min(max(int(limit), 1), 2000)),
+                (point_id, horizon, object_id, object_id, kind, kind, run_id, run_id, point_id, horizon, point_id, horizon, min(max(int(limit), 1), 2000)),
             ).fetchall()
         return [dict(r) for r in rows]
 

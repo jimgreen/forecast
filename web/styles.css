@@ -11,3 +11,16 @@ html,body{height:100%;overflow:hidden}.app-shell{height:100vh;min-height:0;overf
    inside their own view with the scrollbar chrome hidden. */
 html,body{height:100%;overflow:hidden}.app-shell{height:100vh;min-height:0;overflow:hidden}.main-area{height:100vh;overflow:hidden}.content{height:calc(100vh - 67px);overflow:hidden}.view.active{height:100%;overflow-y:auto;overflow-x:hidden;scrollbar-width:none}.view.active::-webkit-scrollbar{width:0;height:0}.view.active{overscroll-behavior:contain}.line-chart,.line-chart.large{max-width:100%;overflow:hidden}.table-wrap{max-width:100%;overflow-x:auto;scrollbar-width:none}.table-wrap::-webkit-scrollbar{height:0}
 html,body{height:100%;overflow:hidden}.view.active{overflow:hidden}.table-wrap{overflow:hidden}.table-wrap table{min-width:0;max-width:100%;table-layout:fixed}.table-wrap th,.table-wrap td{overflow:hidden;text-overflow:ellipsis}
+/* Paged tables keep every record reachable inside a fixed-height panel. */
+.sub-panel>.panel.paged-panel{display:flex;flex-direction:column;min-height:0}
+.paged-panel>.table-wrap{flex:1;min-height:0;overflow:hidden}
+.paged-panel>.panel-header,.paged-panel>.query-bar{flex-shrink:0}
+.paged-panel .table-wrap tbody tr{height:36px}
+.paged-panel .table-wrap td{padding:5px 8px;height:36px}
+.paged-panel .table-wrap tr[hidden]{display:none}
+.table-pager{display:flex;align-items:center;gap:8px;flex:0 0 38px;min-width:0;font-size:11px;color:var(--muted)}
+.table-pager>span{margin-right:auto;white-space:nowrap}
+.table-pager button{padding:5px 8px;font-size:11px}
+.table-pager input{width:54px;padding:4px;background:#091a2c;color:var(--text);border:1px solid #29445d;border-radius:4px}
+button:disabled{opacity:.45;cursor:default;transform:none}
+[data-latest-results]{font-size:11px}
