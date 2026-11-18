@@ -13,6 +13,20 @@ from forecast_pipeline.schema import WEATHER_COLUMNS, TARGET_COLUMNS
 from scripts.demo import make_demo_data
 
 
+@pytest.mark.parametrize('window', [4, 16, 96])
+def test_online_rolling_statistics_match_finite_window_reference(window):
+    from forecast_pipeline.model import _RollingWindow
+    values = np.r_[np.full(120, 1e9), 1e9 + np.sin(np.arange(600) / 9), np.full(120, np.nan)]
+    values[131:134] = np.inf
+    rolling = _RollingWindow(window, [])
+    for position, value in enumerate(values):
+        rolling.append(value)
+        prior = values[max(0, position-window+1):position+1]
+        prior = prior[np.isfinite(prior)]
+        expected = (prior.mean() if len(prior) else 0, prior.std(ddof=1) if len(prior)>1 else 0)
+        np.testing.assert_allclose(rolling.moments(), expected, atol=2e-7, rtol=1e-9)
+
+
 def test_vector_features_match_scalar_with_missing_samples():
     frame = make_demo_data().iloc[:800].set_index('timestamp')
     frame.loc[frame.index[[0, 7, 100]], 'load_kw'] = np.nan

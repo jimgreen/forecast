@@ -230,13 +230,15 @@ def prepare_power_training_frame(frame: pd.DataFrame) -> tuple[pd.DataFrame, dic
     if frame.empty:
         return frame, {"curtailment_samples": 0, "adjusted_samples": 0}
     result = frame.copy()
-    flag = result.get("curtailment_flag", pd.Series(False, index=result.index)).fillna(0).astype(bool)
+    source = result.get("source", pd.Series("", index=result.index)).fillna("").astype(str).str.lower().str.strip()
+    authoritative = ~source.isin({"test", "demo", "seed", "sample", "mock", "fixture"})
+    flag = result.get("curtailment_flag", pd.Series(False, index=result.index)).fillna(0).astype(bool) & authoritative
     adjusted = 0
     adjusted_mask = pd.Series(False, index=result.index)
     for target, available in (("pv_power_kw", "pv_available_power_kw"), ("wind_power_kw", "wind_available_power_kw")):
         if available in result:
             available_values = pd.to_numeric(result[available], errors="coerce")
-            use = available_values.notna() & (flag | (available_values > pd.to_numeric(result[target], errors="coerce")))
+            use = available_values.notna() & authoritative & (flag | (available_values > pd.to_numeric(result[target], errors="coerce")))
             result.loc[use, target] = available_values.loc[use]
             adjusted += int(use.sum())
             adjusted_mask = adjusted_mask | use
@@ -255,14 +257,17 @@ def curtailment_summary(point_id: str | None = None) -> dict[str, object]:
         params = (point_id,) if point_id else ()
         row = conn.execute(
             f"""SELECT COUNT(*) AS samples,
-                SUM(curtailment_flag) AS flagged_samples,
-                SUM(COALESCE(pv_curtailment_kw,0)) AS pv_loss_kw,
-                SUM(COALESCE(wind_curtailment_kw,0)) AS wind_loss_kw
+                SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    AND (curtailment_flag=1 OR pv_curtailment_kw IS NOT NULL OR wind_curtailment_kw IS NOT NULL) THEN 1 ELSE 0 END) AS known_samples,
+                SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    THEN COALESCE(pv_curtailment_kw,0) ELSE 0 END) AS pv_loss_kw,
+                SUM(CASE WHEN LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')
+                    THEN COALESCE(wind_curtailment_kw,0) ELSE 0 END) AS wind_loss_kw
                 FROM energy_measurements {where}""", params,
         ).fetchone()
     samples = int(row["samples"] or 0)
-    flagged = int(row["flagged_samples"] or 0)
-    return {"samples": samples, "curtailment_samples": flagged, "curtailment_rate": round(flagged / samples * 100, 2) if samples else 0.0, "pv_loss_kw": float(row["pv_loss_kw"] or 0), "wind_loss_kw": float(row["wind_loss_kw"] or 0)}
+    known = int(row["known_samples"] or 0)
+    return {"samples": samples, "known": bool(known), "curtailment_samples": known, "unknown_samples": max(0, samples-known), "curtailment_rate": round(known / samples * 100, 2) if known else None, "pv_loss_kw": float(row["pv_loss_kw"]) if known else None, "wind_loss_kw": float(row["wind_loss_kw"]) if known else None}
 
 
 def forecast_anchor(frame: pd.DataFrame) -> pd.Timestamp:
@@ -443,14 +448,16 @@ def evaluate_run(run_id: str) -> dict[str, object]:
             table = "weather_forecasts" if target in WEATHER_TARGETS else "energy_forecasts"
             actual_table = "weather_observations" if target in WEATHER_TARGETS else "energy_measurements"
             forecast_rows = conn.execute(f"SELECT target_time_utc,{target} AS value FROM {table} WHERE run_id=?", (run_id,)).fetchall()
+            authoritative_sql = "LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')"
             if target == "pv_power_kw":
-                actual_sql = "COALESCE(pv_available_power_kw,pv_power_kw)"
+                actual_sql = f"CASE WHEN {authoritative_sql} THEN COALESCE(pv_available_power_kw,pv_power_kw) ELSE pv_power_kw END"
             elif target == "wind_power_kw":
-                actual_sql = "COALESCE(wind_available_power_kw,wind_power_kw)"
+                actual_sql = f"CASE WHEN {authoritative_sql} THEN COALESCE(wind_available_power_kw,wind_power_kw) ELSE wind_power_kw END"
             else:
                 actual_sql = target
-            flag_sql = "curtailment_flag" if target in ENERGY_TARGETS else "0"
-            actual_rows = conn.execute(f"SELECT timestamp_utc,{actual_sql} AS value,{flag_sql} AS curtailment_flag FROM {actual_table} WHERE point_id=?", (run["point_id"],)).fetchall()
+            flag_sql = f"CASE WHEN {authoritative_sql} THEN curtailment_flag ELSE 0 END" if target in ENERGY_TARGETS else "0"
+            source_filter = " AND LOWER(TRIM(source)) NOT IN ('test','demo','seed','sample','mock','fixture')" if target in ENERGY_TARGETS else ""
+            actual_rows = conn.execute(f"SELECT timestamp_utc,{actual_sql} AS value,{flag_sql} AS curtailment_flag FROM {actual_table} WHERE point_id=?{source_filter}", (run["point_id"],)).fetchall()
             actual = pd.Series({parse_dt(row["timestamp_utc"]): row["value"] for row in actual_rows}, dtype=float)
             predicted = pd.Series({parse_dt(row["target_time_utc"]): row["value"] for row in forecast_rows}, dtype=float)
             result = metric_values(actual, predicted)
@@ -631,6 +638,7 @@ class Handler(BaseHTTPRequestHandler):
                 if horizon not in HORIZONS: raise ValueError("unsupported horizon")
                 object_id = query.get("object_id", [None])[0]
                 run_id = query.get("run_id", [None])[0]
+                run = None
                 if run_id:
                     with DB.connection() as conn:
                         run = conn.execute("SELECT * FROM forecast_runs WHERE run_id=?", (run_id,)).fetchone()
@@ -659,7 +667,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not run_id:
                     with DB.connection() as conn:
                         latest = conn.execute(
-                            """SELECT run_id,object_id FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
+                            """SELECT * FROM forecast_runs WHERE point_id=? AND horizon=? AND status='success'
                             AND (? IS NULL OR object_id=?) AND (? IS NULL OR forecast_kind=? OR forecast_kind='combined')
                             ORDER BY COALESCE(finished_at,started_at) DESC,started_at DESC LIMIT 1""",
                             (point_id, horizon, object_id, object_id, kind, kind),
@@ -667,8 +675,9 @@ class Handler(BaseHTTPRequestHandler):
                     run_id = latest["run_id"] if latest else None
                     if latest:
                         object_id = latest["object_id"]
+                        run = latest
                 requested_limit = min(max(int(query.get("limit", [horizon_count(horizon)])[0]), 1), 2000)
-                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id, kind)})
+                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "run": dict(run) if run else None, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id, kind)})
             elif parsed.path == "/api/runs":
                 self.json_response({"runs": DB.list_runs(
                     min(max(int(query.get("limit", [50])[0]), 1), 200),

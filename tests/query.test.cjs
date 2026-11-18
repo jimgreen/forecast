@@ -12,8 +12,8 @@ function setup() {
   };
   const context = vm.createContext({URLSearchParams, AbortController, console, setTimeout,
     document:{addEventListener(){},querySelector:node,querySelectorAll:()=>[]}});
-  for (const file of ['app.js','query.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../web',file),'utf8'),context);
-  vm.runInContext('renderLineChart=()=>{};renderLegend=()=>{};toast=()=>{};for(const d of Object.values(queryDefinitions))d.render=()=>{};',context);
+  for (const file of ['app.js','analysis.js','query.js']) vm.runInContext(fs.readFileSync(path.join(__dirname,'../web',file),'utf8'),context);
+  vm.runInContext('renderQueryChart=()=>{};renderQueryAnalytics=()=>{};renderLegend=()=>{};toast=()=>{};for(const d of Object.values(queryDefinitions))d.render=()=>{};',context);
   node('#resultObject').value='OBJ-GRID';node('#resultHorizon').value='week_ahead';node('#resultMetric').value='all';
   node('.query-point').value='P002';node('#weatherResultHorizon').value='hour_ahead';node('#weatherResultMetric').value='all';
   return {context,node};
@@ -53,12 +53,12 @@ test('energy quality uses the same time range and clears stale values on failure
   const {context,node}=setup();
   vm.runInContext("queryDefinitions.energy.render=renderQuality",context);
   context.fetch=async()=>({ok:true,json:async()=>({measurements:[
-    {timestamp:new Date().toISOString(),quality_code:'valid',curtailment_flag:1,pv_curtailment_kw:4},
+    {timestamp:new Date().toISOString(),quality_code:'valid',source:'test',curtailment_flag:1,pv_curtailment_kw:4},
     {timestamp:'2000-01-01T00:00:00Z',quality_code:'valid',pv_curtailment_kw:100}
   ]})});
   await vm.runInContext("queryPage('energy')",context);
   assert.equal(vm.runInContext("querySnapshots.get('energy-input').rows.length",context),1);
-  assert.match(node('#qualityGrid').innerHTML,/<b>1.0 kWh<\/b>/);
+  assert.match(node('#qualityGrid').innerHTML,/<b>未知<\/b>/);
   context.fetch=async()=>({ok:false,json:async()=>({error:'offline'})});
   await vm.runInContext("queryPage('energy')",context);
   assert.match(node('#qualityGrid').innerHTML,/<span>采集记录<\/span><b>0<\/b>/);

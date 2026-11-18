@@ -10,7 +10,7 @@ const queryDefinitions = {
 };
 
 function downloadCSV(rows, columns, name) {
-  const labels={timestamp:'时间',wind_speed_mps:'风速(m/s)',temperature_c:'温度(°C)',solar_radiation_wm2:'太阳辐射(W/m²)',pv_power_kw:'光伏(kW)',wind_power_kw:'风电(kW)',load_kw:'负荷(kW)',source:'来源',point_id:'点位',object_id:'对象',run_id:'运行编号',horizon:'周期'};
+  const labels={timestamp:'时间',wind_speed_mps:'风速(m/s)',temperature_c:'温度(°C)',solar_radiation_wm2:'太阳辐射(W/m²)',pv_power_kw:'光伏(kW)',wind_power_kw:'风电(kW)',load_kw:'负荷(kW)',source:'来源',point_id:'点位',object_id:'对象',run_id:'运行编号',horizon:'周期',metric:'变量',unit:'单位',min:'最小值',min_time:'最小值时刻',max:'最大值',max_time:'最大值时刻',mean:'平均值',count:'有效样本',missing:'缺测样本',integral:'累计量',integral_unit:'累计量单位',gaps:'时间缺口',duplicates:'重复时刻',date:'日期',time_zone:'时区'};
   const csv='\uFEFF'+[columns.map(key=>labels[key]||key),...rows.map(row=>columns.map(key=>row[key]))].map(row=>row.map(csvCell).join(',')).join('\r\n');
   const url=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'}));
   const link=document.createElement('a');
@@ -34,8 +34,9 @@ async function queryPage(kind) {
   $all('.export-btn',view).forEach(button=>button.disabled=true);
   $(def.hint).textContent='查询中…';
   const specs=metricSpecs(kind==='weather-results'?'weather':kind,metric);
-  renderLineChart($(def.chart),[],specs);
+  renderQueryChart($(def.chart),[],specs);
   def.render([]);
+  renderQueryAnalytics(kind,snapshot);
   try{
     let path,field='rows';
     const hours=Number($('.query-range',view)?.value||24);
@@ -53,18 +54,22 @@ async function queryPage(kind) {
     snapshot.rows=(data[field]||[]).map(row=>({...row,timestamp:row.timestamp||row.timestamp_utc}));
     if(!horizon)snapshot.rows=snapshot.rows.filter(row=>Date.parse(row.timestamp)>=Date.now()-hours*3600000).sort((a,b)=>Date.parse(a.timestamp)-Date.parse(b.timestamp));
     snapshot.runId=data.run_id||snapshot.runId;
+    snapshot.run=data.run||snapshot.run;
     if(horizon)snapshot.objectId=data.object_id||snapshot.objectId;
     snapshot.loading=false;
-    renderLineChart($(def.chart),snapshot.rows,specs);
+    renderQueryChart($(def.chart),snapshot.rows,specs);
     renderLegend(def.legend,specs);
     def.render(snapshot.rows);
+    renderQueryAnalytics(kind,snapshot);
     const label=kind==='results'?objectById(objectId)?.object_name||objectId:pointById(point)?.name||point;
     $(def.hint).textContent=label+' · '+(horizon?horizonNames[horizon]:'最近 '+hours+' 小时实测')+' · '+snapshot.rows.length+' 条'+(snapshot.runId?' · '+snapshot.runId:'')+(snapshot.rows.length?'':' · 暂无数据');
     $all('.export-btn',view).forEach(button=>button.disabled=!snapshot.rows.length);
   }catch(error){
     if(querySnapshots.get(def.page)!==snapshot)return;
     snapshot.loading=false;snapshot.error=error.message;
+    snapshot.run=null;
     $(def.hint).textContent='查询失败：'+error.message;
+    renderQueryAnalytics(kind,snapshot);
   }
   const latest=$('[data-latest-results]',view);
   if(latest)latest.hidden=!pinnedRuns.has(def.page);
@@ -138,6 +143,7 @@ document.addEventListener('DOMContentLoaded',()=>{
       button.addEventListener('click',()=>{pinnedRuns.delete(def.page);queryPage(kind)});
     }
     $all('.query-point,.query-range,#resultObject',view).forEach(select=>select.addEventListener('change',()=>queryPage(kind)));
+    installQueryAnalytics(kind,def,view);
   }
   $all('.table-wrap tbody').forEach(installTablePager);
 });

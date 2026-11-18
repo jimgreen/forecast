@@ -24,3 +24,14 @@ html,body{height:100%;overflow:hidden}.view.active{overflow:hidden}.table-wrap{o
 .table-pager input{width:54px;padding:4px;background:#091a2c;color:var(--text);border:1px solid #29445d;border-radius:4px}
 button:disabled{opacity:.45;cursor:default;transform:none}
 [data-latest-results]{font-size:11px}
+.day-filter{display:flex;align-items:end;gap:6px;white-space:nowrap}
+.day-picker{display:flex;align-items:center;gap:4px;margin-top:5px}
+.day-picker button{width:26px;height:30px;padding:0;font-size:18px;line-height:1}
+.day-picker select{min-width:116px}
+.analytics-panel{display:flex;flex-direction:column;min-height:0;height:100%}
+.analytics-panel .table-wrap{flex:1;min-height:0}
+.analytics-panel table{table-layout:auto}
+.analytics-panel td small{display:block;color:var(--muted);font-size:9px;margin-top:3px;white-space:nowrap}
+.analysis-note,.chart-readout{margin:8px 0 0;color:var(--muted);font-size:10px;min-height:16px}
+.chart-readout{padding:5px 9px;background:#0b1c2e;border:1px solid #1d3850;border-radius:5px}
+.query-chart .chart-readout{flex:0 0 auto}

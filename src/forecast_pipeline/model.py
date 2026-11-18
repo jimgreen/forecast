@@ -8,6 +8,8 @@ without changing the input/output contract.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
+from math import fsum, isfinite, sqrt
 from typing import Mapping
 
 import numpy as np
@@ -34,9 +36,7 @@ def _feature_row(
 ) -> list[float]:
     """Build one feature vector while allowing callers to reuse index arrays.
 
-    Training and recursive prediction call this function many times. Reusing the
-    already known row position and target array avoids a repeated ``searchsorted``
-    and pandas-to-NumPy conversion for every sample.
+    Kept as a scalar reference for feature and recursive-prediction verification.
     """
     if position is None:
         position = int(history.index.searchsorted(timestamp, side="left"))
@@ -90,6 +90,56 @@ def _feature_matrix(data: pd.DataFrame, target: str, base: np.ndarray) -> np.nda
     return np.column_stack(parts)
 
 
+class _RollingWindow:
+    """Finite-only sliding moments with a local origin to limit cancellation."""
+
+    def __init__(self, size: int, values):
+        self.size = size
+        self.values = deque(float(value) for value in values)
+        self.updates = 0
+        self._rebuild()
+
+    def _rebuild(self):
+        finite = [value for value in self.values if isfinite(value)]
+        self.count = len(finite)
+        self.origin = finite[0] if finite else 0.0
+        shifted = [value - self.origin for value in finite]
+        self.total = fsum(shifted)
+        self.squares = fsum(value * value for value in shifted)
+
+    def append(self, value):
+        if len(self.values) == self.size:
+            old = self.values.popleft()
+            if isfinite(old):
+                shifted = old - self.origin
+                self.count -= 1
+                self.total -= shifted
+                self.squares -= shifted * shifted
+        value = float(value)
+        self.values.append(value)
+        if isfinite(value):
+            shifted = value - self.origin
+            self.count += 1
+            self.total += shifted
+            self.squares += shifted * shifted
+        self.updates += 1
+        # Bound accumulated rounding error, including all-missing transitions.
+        if self.updates % 96 == 0 or self.count <= 1:
+            self._rebuild()
+
+    def moments(self):
+        if not self.count:
+            return 0.0, 0.0
+        mean = self.origin + self.total / self.count
+        if self.count == 1:
+            return mean, 0.0
+        centered = self.squares - self.total * self.total / self.count
+        if centered <= 1e-10 * max(self.squares, 1.0):
+            # Nearly constant windows need a direct, stable variance calculation.
+            centered = fsum((value - mean) ** 2 for value in self.values if isfinite(value))
+        return mean, sqrt(max(0.0, centered) / (self.count - 1))
+
+
 @dataclass
 class Ridge15MinForecaster:
     targets: tuple[str, ...] = TARGET_COLUMNS
@@ -127,18 +177,28 @@ class Ridge15MinForecaster:
         offsets = {name: i for i, name in enumerate(columns)}
         base = _base_features(future.index, future[list(WEATHER_COLUMNS)].to_numpy(dtype=float))
         predictions = np.empty((len(future), len(self.targets)))
-        for step, position in enumerate(index.get_indexer(future.index)):
+        positions = index.get_indexer(future.index)
+        first_position = int(positions[0]) if len(positions) else 0
+        windows = {
+            target: [_RollingWindow(size, state[max(0, first_position-size):first_position, offsets[target]])
+                     for size in (4, 16, 96)]
+            for target in self.targets
+        }
+        previous_position = first_position
+        for step, position in enumerate(positions):
+            for prior_row in state[previous_position:position]:
+                for target in self.targets:
+                    for window in windows[target]:
+                        window.append(prior_row[offsets[target]])
+            previous_position = position
             state[position, :3] = base[step, :3]
             for target_index, target in enumerate(self.targets):
                 values = state[:, offsets[target]]
                 row = [*np.where(np.isfinite(state[position, :3]), state[position, :3], 0), *base[step, 3:]]
                 row[2] = max(0.0, row[2])
                 row.extend(_scalar(values[position-lag]) if position >= lag else 0.0 for lag in (1, 2, 4, 96, 672))
-                for window in (4, 16, 96):
-                    prior = values[max(0, position-window):position]
-                    prior = prior[np.isfinite(prior)]
-                    row.extend((float(prior.mean()) if len(prior) else 0.0,
-                                float(prior.std(ddof=1)) if len(prior) > 1 else 0.0))
+                for window in windows[target]:
+                    row.extend(window.moments())
                 vector = np.asarray([1.0, *row])
                 value = float(vector @ self.coefficients[target])
                 if target.endswith("_power_kw") or target in {"load_kw", "wind_speed_mps", "solar_radiation_wm2"}:
