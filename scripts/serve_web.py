@@ -14,7 +14,9 @@ import mimetypes
 import sys
 import threading
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from uuid import uuid4
@@ -69,6 +71,11 @@ def parse_dt(value: object) -> datetime:
 
 
 def load_demo_frame() -> pd.DataFrame:
+    return _load_demo_frame_cached().copy()
+
+
+@lru_cache(maxsize=1)
+def _load_demo_frame_cached() -> pd.DataFrame:
     frame = pd.read_csv(DATA)
     frame = frame.rename(columns={frame.columns[0]: "timestamp"})
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
@@ -314,6 +321,39 @@ def fused_future_weather(point_id: str, horizon: str, future_index: pd.DatetimeI
     return fused.reindex(future_index)[list(WEATHER_TARGETS)].interpolate(method="time").ffill().bfill()
 
 
+_PIPELINE_CACHE: dict[tuple[object, ...], IntegratedForecastPipeline] = {}
+_PIPELINE_CACHE_LOCK = threading.RLock()
+
+
+def cached_pipeline(
+    history: pd.DataFrame,
+    targets: tuple[str, ...],
+    capacity_limits: dict[str, float],
+    cache_scope: str,
+) -> IntegratedForecastPipeline:
+    """Reuse a fitted pipeline while the input tail and limits are unchanged."""
+    required = [*WEATHER_TARGETS, *targets]
+    sample = history[required].tail(8)
+    fingerprint = int(pd.util.hash_pandas_object(sample, index=True).sum()) if not sample.empty else 0
+    key = (
+        cache_scope,
+        len(history),
+        str(history.index[-1]) if len(history.index) else "",
+        fingerprint,
+        targets,
+        tuple(sorted(capacity_limits.items())),
+    )
+    with _PIPELINE_CACHE_LOCK:
+        pipeline = _PIPELINE_CACHE.get(key)
+        if pipeline is None:
+            pipeline = IntegratedForecastPipeline().fit(history, targets=targets, capacity_limits=capacity_limits)
+            _PIPELINE_CACHE[key] = pipeline
+            while len(_PIPELINE_CACHE) > 16:
+                _PIPELINE_CACHE.pop(next(iter(_PIPELINE_CACHE)))
+        return pipeline
+
+
+@lru_cache(maxsize=4)
 def load_template_rows(horizon: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     with DATA.open(encoding="utf-8-sig", newline="") as stream:
@@ -461,7 +501,7 @@ def execute_run(run_id: str, point_id: str, kind: str, horizon: str) -> dict[str
             history_indexed = history.set_index("timestamp")
             future_index = make_future_index(forecast_anchor(local_weather), horizon)
             future_weather = fused_future_weather(point_id, horizon, future_index, local=local_weather)
-            predictions = IntegratedForecastPipeline().fit(history_indexed, targets=WEATHER_TARGETS).predict(horizon, future_weather=future_weather)
+            predictions = cached_pipeline(history_indexed, WEATHER_TARGETS, {}, f"weather:{point_id}").predict(horizon, future_weather=future_weather)
             rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "source": "NWP + 本地微气象校正", "quality_score": 0.92} for index, row in predictions.iterrows()]
         else:
             history = load_power_training_frame(point_id)
@@ -473,7 +513,7 @@ def execute_run(run_id: str, point_id: str, kind: str, horizon: str) -> dict[str
             future_weather = fused_future_weather(point_id, horizon, future_index, local=local_weather)
             energy_targets = energy_targets_for(source_history)
             targets = energy_targets if kind == "energy" else (*WEATHER_TARGETS, *energy_targets)
-            predictions = IntegratedForecastPipeline().fit(history_indexed, targets=targets, capacity_limits=limits).predict(horizon, future_weather=future_weather)
+            predictions = cached_pipeline(history_indexed, targets, limits, f"energy:{point_id}:{object_id}:{kind}").predict(horizon, future_weather=future_weather)
             rows = [{"timestamp": index.isoformat(), **{column: float(value) for column, value in row.items()}, "pv_available_power_kw": float(row.get("pv_power_kw", 0.0)), "wind_available_power_kw": float(row.get("wind_power_kw", 0.0)), "prediction_basis": "available_power_corrected", "source": "NWP + 本地微气象校正", "quality_score": 0.90 if quality["adjusted_samples"] else 0.86} for index, row in predictions.iterrows()]
         written = DB.save_forecast_rows(run_id, point_id, horizon, rows, kind, "Ridge 15分钟基线", "NWP + 本地校正")
         return {"run_id": run_id, "status": "success", "rows_written": written, "evaluation": evaluate_run(run_id)}
@@ -584,7 +624,8 @@ class Handler(BaseHTTPRequestHandler):
                     if not obj: raise ValueError("unknown object_id")
                     point_id = str(obj["point_id"])
                 run_id = query.get("run_id", [None])[0]
-                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, horizon_count(horizon), run_id, object_id)})
+                requested_limit = min(max(int(query.get("limit", [horizon_count(horizon)])[0]), 1), 2000)
+                self.json_response({"point_id": point_id, "object_id": object_id, "horizon": horizon, "run_id": run_id, "rows": DB.get_forecast_rows(point_id, horizon, requested_limit, run_id, object_id)})
             elif parsed.path == "/api/runs":
                 self.json_response({"runs": DB.list_runs(min(max(int(query.get("limit", [50])[0]), 1), 200), query.get("status", [None])[0], query.get("point_id", [None])[0])})
             elif parsed.path == "/api/models":
@@ -657,16 +698,30 @@ class Handler(BaseHTTPRequestHandler):
                     scheduled_at = parse_dt(scheduled_at).isoformat()
                 else:
                     scheduled_at = None
-                run_results = []
-                for index, point_id in enumerate(point_ids):
-                    object_id = resolved_objects[index]["object_id"] if resolved_objects else str(point_id)
-                    run_id = new_id("FC"); DB.create_run(run_id, str(point_id), kind, horizon, trigger, scheduled_at, object_id)
+                run_specs = [
+                    (str(point_id), resolved_objects[index]["object_id"] if resolved_objects else str(point_id))
+                    for index, point_id in enumerate(point_ids)
+                ]
+
+                def run_one(spec: tuple[str, str]) -> dict[str, object]:
+                    point_id, object_id = spec
+                    run_id = new_id("FC")
+                    DB.create_run(run_id, point_id, kind, horizon, trigger, scheduled_at, object_id)
                     if scheduled_at and parse_dt(scheduled_at) > now_dt():
-                        run_results.append({"run_id": run_id, "object_id": object_id, "status": "accepted"})
-                    else:
-                        result = execute_run(run_id, str(point_id), kind, horizon)
-                        result["object_id"] = object_id
-                        run_results.append(result)
+                        return {"run_id": run_id, "object_id": object_id, "status": "accepted"}
+                    result = execute_run(run_id, point_id, kind, horizon)
+                    result["object_id"] = object_id
+                    return result
+
+                if scheduled_at and parse_dt(scheduled_at) > now_dt():
+                    run_results = [run_one(spec) for spec in run_specs]
+                elif len(run_specs) > 1:
+                    # Independent objects use separate SQLite connections, so a
+                    # bounded pool reduces waiting time for multi-object runs.
+                    with ThreadPoolExecutor(max_workers=min(4, len(run_specs)), thread_name_prefix="forecast-run") as pool:
+                        run_results = list(pool.map(run_one, run_specs))
+                else:
+                    run_results = [run_one(run_specs[0])]
                 self.json_response({"run_id": run_results[0]["run_id"], "run_ids": [item["run_id"] for item in run_results], "object_ids": [item.get("object_id") for item in run_results], "status": run_results[-1]["status"], "results": run_results, "received": payload, "created_at": now_iso()})
             elif parsed.path in {"/api/train", "/api/training"}:
                 object_ids = payload.get("object_ids") or ([payload.get("object_id")] if payload.get("object_id") else [])

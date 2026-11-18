@@ -24,10 +24,25 @@ def _scalar(value: object, default: float = 0.0) -> float:
     return value if np.isfinite(value) else default
 
 
-def _feature_row(timestamp: pd.Timestamp, history: pd.DataFrame, target: str) -> list[float]:
-    position = int(history.index.searchsorted(timestamp, side="left"))
+def _feature_row(
+    timestamp: pd.Timestamp,
+    history: pd.DataFrame,
+    target: str,
+    *,
+    position: int | None = None,
+    target_values: np.ndarray | None = None,
+) -> list[float]:
+    """Build one feature vector while allowing callers to reuse index arrays.
+
+    Training and recursive prediction call this function many times. Reusing the
+    already known row position and target array avoids a repeated ``searchsorted``
+    and pandas-to-NumPy conversion for every sample.
+    """
+    if position is None:
+        position = int(history.index.searchsorted(timestamp, side="left"))
     row = history.iloc[position] if position < len(history) and history.index[position] == timestamp else history.iloc[max(0, position - 1)]
-    target_values = history[target].to_numpy(dtype=float, na_value=np.nan)
+    if target_values is None:
+        target_values = history[target].to_numpy(dtype=float, na_value=np.nan)
     hour = timestamp.hour + timestamp.minute / 60.0
     quarter = timestamp.hour * 4 + timestamp.minute // 15
     values = [
@@ -63,14 +78,18 @@ class Ridge15MinForecaster:
         required = [*WEATHER_COLUMNS, *self.targets]
         require_columns(frame, required, "training data")
         data = frame.copy().sort_index()
+        positions = range(len(data))
+        target_arrays = {target: data[target].to_numpy(dtype=float, na_value=np.nan) for target in self.targets}
         for target in self.targets:
             rows: list[list[float]] = []
             ys: list[float] = []
-            for timestamp in data.index:
-                if not np.isfinite(data.at[timestamp, target]):
+            target_values = target_arrays[target]
+            for position, timestamp in zip(positions, data.index):
+                value = target_values[position]
+                if not np.isfinite(value):
                     continue
-                rows.append(_feature_row(timestamp, data, target))
-                ys.append(_scalar(data.at[timestamp, target]))
+                rows.append(_feature_row(timestamp, data, target, position=position, target_values=target_values))
+                ys.append(_scalar(value))
             if len(rows) < 32:
                 raise ValueError(f"not enough valid rows to train {target}: {len(rows)}")
             x = np.asarray(rows, dtype=float)
@@ -90,8 +109,10 @@ class Ridge15MinForecaster:
         predictions = pd.DataFrame(index=future.index, columns=self.targets, dtype=float)
         for timestamp in future.index:
             state.loc[timestamp, WEATHER_COLUMNS] = future.loc[timestamp, WEATHER_COLUMNS]
+            position = len(state.index) - 1
             for target in self.targets:
-                row = _feature_row(timestamp, state, target)
+                target_values = state[target].to_numpy(dtype=float, na_value=np.nan)
+                row = _feature_row(timestamp, state, target, position=position, target_values=target_values)
                 vector = np.asarray([1.0, *row], dtype=float)
                 value = float(vector @ self.coefficients[target])
                 if target.endswith("_power_kw") or target in {"load_kw", "wind_speed_mps", "solar_radiation_wm2"}:
